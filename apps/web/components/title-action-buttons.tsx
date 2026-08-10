@@ -1,20 +1,13 @@
 "use client";
 
-import { Check, DownloadCloud, Layers, LoaderCircle } from "lucide-react";
-import { useState, useTransition } from "react";
+import { Check, DownloadCloud, Layers } from "lucide-react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
-import {
-  requestRemainingAction,
-  requestSeasonAction,
-  type RequestTrackingActionResult,
-} from "../app/actions";
-import { runAction } from "../lib/run-action";
-import { useAcquisitionLock } from "./acquisition-lock";
-import { AcquireResultNotice, isLockedResult } from "./request-state";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { DemoAcquirePlayback } from "./demo-acquire-playback";
 import type { DemoAcquisitionEntry } from "../lib/demo-session";
 import { useDemoAcquiredTmdbIds } from "../lib/use-demo-session";
+import { resourcePickerHref } from "../lib/resource-picker-link";
 
 export function RequestSeasonButton({
   tmdbId,
@@ -34,14 +27,6 @@ export function RequestSeasonButton({
   demoEntry?: DemoAcquisitionEntry | undefined;
 }) {
   const router = useRouter();
-  const lock = useAcquisitionLock();
-  const [isPending, startTransition] = useTransition();
-  const [result, setResult] = useState<RequestTrackingActionResult | null>(null);
-  const scope = `season-${seasonNumber}`;
-  const isLocked = isLockedResult(result);
-  const mine = lock?.acquiring === scope;
-  const othersAcquiring = (lock != null && lock.acquiring != null && !mine) || titleAcquiring;
-  const inFlight = isPending || mine;
   const demo = isDemoModeClient();
   const [demoPlaying, setDemoPlaying] = useState(false);
   const acquiredIds = useDemoAcquiredTmdbIds();
@@ -60,47 +45,29 @@ export function RequestSeasonButton({
   }
 
   return (
-    <>
       <button
         className="season-request-button"
         type="button"
-        title={
-          othersAcquiring && !inFlight ? "该剧正在获取中，请稍候" : result?.message ?? `获取第 ${seasonNumber} 季`
-        }
-        disabled={isPending || isLocked || othersAcquiring}
+        title={titleAcquiring ? "该剧正在获取中，请稍候" : `检索第 ${seasonNumber} 季资源`}
+        disabled={titleAcquiring}
         onClick={() => {
           if (demo) {
             setDemoPlaying(true);
             return;
           }
-          lock?.lock(scope);
-          startTransition(async () => {
-            const r = await runAction(
-              () => requestSeasonAction({ tmdbId, seasonNumber, storageId }),
-              (msg) => {
-                setResult({ status: "unsupported", message: msg });
-                // 必须 refresh:lock.acquiring 是前端 state,靠重挂载重置。
-                // 失败不刷新,锁永远卡住,兄弟按钮全禁用(Copilot round 1)。
-                router.refresh();
-              },
-            );
-            if (!r.ok) return;
-            setResult(r.value);
-            router.refresh();
-          });
+          router.push(
+            resourcePickerHref({
+              kind: "season",
+              tmdbId,
+              seasonNumber,
+              ...(storageId ? { storageId } : {}),
+            }),
+          );
         }}
       >
-        {inFlight ? (
-          <LoaderCircle size={13} className="spin" aria-hidden />
-        ) : isLocked ? (
-          <Check size={13} aria-hidden />
-        ) : (
-          <DownloadCloud size={13} aria-hidden />
-        )}
-        {inFlight ? "获取中" : isLocked ? "已请求" : "获取本季"}
+        <DownloadCloud size={13} aria-hidden />
+        获取本季
       </button>
-      <AcquireResultNotice result={result} />
-    </>
   );
 }
 
@@ -122,14 +89,6 @@ export function RequestRemainingButton({
   demoEntry?: DemoAcquisitionEntry | undefined;
 }) {
   const router = useRouter();
-  const lock = useAcquisitionLock();
-  const [isPending, startTransition] = useTransition();
-  const [result, setResult] = useState<RequestTrackingActionResult | null>(null);
-  const scope = "remaining";
-  const isLocked = isLockedResult(result);
-  const mine = lock?.acquiring === scope;
-  const othersAcquiring = (lock != null && lock.acquiring != null && !mine) || titleAcquiring;
-  const inFlight = isPending || mine;
   const demo = isDemoModeClient();
   const [demoPlaying, setDemoPlaying] = useState(false);
   const acquiredIds = useDemoAcquiredTmdbIds();
@@ -148,43 +107,23 @@ export function RequestRemainingButton({
   }
 
   return (
-    <>
       <button
         className="primary-button"
         type="button"
-        title={othersAcquiring && !inFlight ? "该剧正在获取中，请稍候" : result?.message ?? label}
-        disabled={isPending || isLocked || othersAcquiring}
+        title={titleAcquiring ? "该剧正在获取中，请稍候" : "检索剩余季资源"}
+        disabled={titleAcquiring}
         onClick={() => {
           if (demo) {
             setDemoPlaying(true);
             return;
           }
-          lock?.lock(scope);
-          startTransition(async () => {
-            const r = await runAction(
-              () => requestRemainingAction({ tmdbId, storageId }),
-              (msg) => {
-                setResult({ status: "unsupported", message: msg });
-                // 同上一处:失败必须 refresh 清锁,否则 sibling 全禁用。
-                router.refresh();
-              },
-            );
-            if (!r.ok) return;
-            setResult(r.value);
-            router.refresh();
-          });
+          router.push(
+            resourcePickerHref({ kind: "remaining", tmdbId, ...(storageId ? { storageId } : {}) }),
+          );
         }}
       >
-        {inFlight ? (
-          <LoaderCircle size={14} className="spin" aria-hidden />
-        ) : isLocked ? (
-          <Check size={14} aria-hidden />
-        ) : (
-          <Layers size={14} aria-hidden />
-        )}
-        {inFlight ? "获取中" : isLocked ? "已请求" : label}
+        <Layers size={14} aria-hidden />
+        {label}
       </button>
-      <AcquireResultNotice result={result} />
-    </>
   );
 }

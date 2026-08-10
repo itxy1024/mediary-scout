@@ -48,6 +48,8 @@ interface TvV2Common {
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
   assrtToken?: string;
+  /** 手动重新选资源时保留此前已经确认入库的集数。 */
+  priorObtained?: string[];
   /**
    * Wall clock for the run. Drives the engine's timestamps (including the
    * terminal notification's `createdAt`) AND the persisted `finishedAt`, which
@@ -166,6 +168,7 @@ export async function runType2InitializationV2AndPersist(
       neededHint: Math.min(input.season.latestAiredEpisode, input.season.totalEpisodes),
       storage: input.storage,
     }),
+    ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
     ...passthrough(input),
   });
 
@@ -263,6 +266,7 @@ export async function runSeriesInitializationV2AndPersist(
       ),
       storage: input.storage,
     }),
+    ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
     ...passthrough(input),
   });
 

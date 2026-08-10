@@ -13,6 +13,7 @@ import {
   Layers,
   PartyPopper,
   RotateCcw,
+  Search,
   TriangleAlert,
   XCircle,
 } from "lucide-react";
@@ -28,6 +29,7 @@ import {
   notificationWindowSince,
   resolveGlobalWorkspace,
 } from "../../lib/workflow-runtime";
+import { manualSelectionResourcePickerHref } from "../../lib/resource-picker-link";
 
 // The kind only drives the leading ICON now — its textual label used to render
 // as a second badge next to the status pill ("开始追踪" beside "已完结"), which
@@ -148,6 +150,22 @@ async function NotificationFeed({ connectedStorageId }: { connectedStorageId: st
     );
   }
 
+  const reselectByNotificationId = new Map<string, string>();
+  for (const notification of notifications) {
+    if (notification.report?.status !== "failed" && notification.report?.status !== "no_coverage") {
+      continue;
+    }
+    const snapshot = await repository.getWorkflowRunSnapshot(notification.workflowRunId, {
+      accountId,
+      connectedStorageId,
+    });
+    const href = manualSelectionResourcePickerHref(
+      snapshot?.resourceSnapshots ?? [],
+      snapshot?.connectedStorageId,
+    );
+    if (href) reselectByNotificationId.set(notification.id, href);
+  }
+
   const days = buildDays(notifications);
   return (
     <section className="feed">
@@ -168,6 +186,7 @@ async function NotificationFeed({ connectedStorageId }: { connectedStorageId: st
                   fallbackPoster={
                     block.notification.report ? fallbackPoster(block.notification.report) : null
                   }
+                  reselectHref={reselectByNotificationId.get(block.notification.id) ?? null}
                 />
               ),
             )}
@@ -182,9 +201,11 @@ async function NotificationFeed({ connectedStorageId }: { connectedStorageId: st
 function NotificationCard({
   notification,
   fallbackPoster = null,
+  reselectHref = null,
 }: {
   notification: NotificationEvent;
   fallbackPoster?: string | null;
+  reselectHref?: string | null;
 }) {
   const icon = kindIcon[notification.kind] ?? { tone: "muted", icon: Bell };
   const KindIcon = icon.icon;
@@ -278,6 +299,11 @@ function NotificationCard({
             </span>
           ) : null}
         </div>
+      ) : null}
+      {reselectHref ? (
+        <Link className="feed-action" href={reselectHref}>
+          <Search size={13} aria-hidden /> 重新选择资源
+        </Link>
       ) : null}
       </div>
     </article>

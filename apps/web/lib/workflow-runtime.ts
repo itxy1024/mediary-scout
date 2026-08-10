@@ -71,6 +71,7 @@ import {
   type WorkflowScope,
   type MediaSearchCandidate,
   type MediaTitle,
+  type ManualResourceSelection,
   type NotificationEvent,
   type ResourceProvider,
   type ResourceType,
@@ -767,6 +768,7 @@ export async function getWorkflowStatusView(
 export async function queueCandidateTracking(
   candidateId: string,
   connectedStorageId?: string | null,
+  manualSelection?: ManualResourceSelection,
 ): Promise<CandidateTrackingRequestResult> {
   let accountId: string;
   try {
@@ -796,6 +798,7 @@ export async function queueCandidateTracking(
       repository: getWorkflowRepository(),
       accountId,
       connectedStorageId: workspace.id,
+      ...(manualSelection ? { manualSelection } : {}),
     });
     return {
       status: request.status === "queued" ? "queued" : request.status,
@@ -819,6 +822,7 @@ export async function queueCandidateTracking(
     repository: getWorkflowRepository(),
     accountId,
     connectedStorageId: workspace.id,
+    ...(manualSelection ? { manualSelection } : {}),
   });
   const status = request.status === "completed" ? "queued" : request.status;
 
@@ -1376,6 +1380,7 @@ async function pushNotificationsSince(
 export async function queueCandidateSeries(
   candidateId: string,
   connectedStorageId?: string | null,
+  manualSelection?: ManualResourceSelection,
 ): Promise<CandidateTrackingRequestResult> {
   const parsed = parseTvCandidateId(candidateId);
   if (!parsed) {
@@ -1410,6 +1415,7 @@ export async function queueCandidateSeries(
       repository: getWorkflowRepository(),
       accountId,
       connectedStorageId: workspace.id,
+      ...(manualSelection ? { manualSelection } : {}),
     });
     return {
       status: request.status === "queued" ? "queued" : request.status,
@@ -1442,6 +1448,7 @@ export async function queueCandidateSeries(
     repository: getWorkflowRepository(),
     accountId,
     connectedStorageId: workspace.id,
+    ...(manualSelection ? { manualSelection } : {}),
   });
   return {
     status: request.status === "queued" ? "queued" : request.status,
@@ -1638,7 +1645,7 @@ async function seedDemoIfEmpty(targetRepository: WorkflowRepository): Promise<vo
   await seedDemoWorkflowRepository(targetRepository);
 }
 
-async function trackingTargetFromCandidateId(candidateId: string): Promise<{
+export async function trackingTargetFromCandidateId(candidateId: string): Promise<{
   title: MediaTitle;
   season: TrackedSeason;
   keyword: string;
@@ -1718,7 +1725,7 @@ function parseTvCandidateId(candidateId: string): { tmdbId: number; seasonNumber
   };
 }
 
-async function getWorkerResourceProvider(
+export async function getWorkerResourceProvider(
   settings: { getSetting(key: string): Promise<string | null> } = getWorkflowRepository(),
   provider: string = "pan115",
   accountId?: string,

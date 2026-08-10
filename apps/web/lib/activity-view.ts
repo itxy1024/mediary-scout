@@ -6,6 +6,7 @@ import {
   type WorkflowRunProgress,
 } from "@media-track/workflow";
 import { distinctSeasons, seasonLabelText } from "./activity-season-label";
+import { manualSelectionResourcePickerHref } from "./resource-picker-link";
 
 // Re-export the pure season-label helpers so existing server-side imports from
 // this module keep working. The CANONICAL home is the runtime-free
@@ -50,6 +51,8 @@ export interface ActivityCompletedItem {
   /** "每集 约 410 MB" / "体积 1.4 GB"; null when unknown. */
   sizeText: string | null;
   createdAt: string;
+  /** 手选资源失败时回到同一范围重新选择；自动任务没有该入口。 */
+  reselectHref: string | null;
 }
 
 export interface ActivityView {
@@ -68,7 +71,7 @@ export interface ActivityView {
 export async function getActivityView(input: {
   repository: Pick<
     WorkflowRepository,
-    "listActiveWorkflowRuns" | "listNotifications" | "listTrackedSeasonStates"
+    "listActiveWorkflowRuns" | "listNotifications" | "listTrackedSeasonStates" | "getWorkflowRunSnapshot"
   >;
   /** Scope the queue/notifications to one account (§7). Omitted → default. */
   accountId?: string;
@@ -133,11 +136,12 @@ export async function getActivityView(input: {
       ? { accountId: input.accountId, connectedStorageId: input.connectedStorageId ?? null }
       : {}),
   });
-  const recentCompleted: ActivityCompletedItem[] = notifications
-    .filter(
-      (notification) => notification.kind !== "already_current" && notification.report !== undefined,
-    )
-    .map((notification) => {
+  const recentCompleted: ActivityCompletedItem[] = await Promise.all(
+    notifications
+      .filter(
+        (notification) => notification.kind !== "already_current" && notification.report !== undefined,
+      )
+      .map(async (notification) => {
       const report = notification.report!;
       const size = landedSize(report);
       const posterPath =
@@ -145,6 +149,11 @@ export async function getActivityView(input: {
         (report.tmdbId != null ? posterByTmdb.get(report.tmdbId) : undefined) ??
         posterByName.get(report.titleName) ??
         null;
+      const snapshot = await input.repository.getWorkflowRunSnapshot(notification.workflowRunId, scope);
+      const reselectHref = manualSelectionResourcePickerHref(
+        snapshot?.resourceSnapshots ?? [],
+        snapshot?.connectedStorageId,
+      );
       return {
         workflowRunId: notification.workflowRunId,
         title: report.titleName,
@@ -153,11 +162,17 @@ export async function getActivityView(input: {
         posterPath,
         sizeText: size ? `${size.label} ${size.value}` : null,
         createdAt: notification.createdAt,
+        reselectHref:
+          reselectHref && (report.status === "failed" || report.status === "no_coverage")
+            ? reselectHref
+            : null,
       };
-    });
+      }),
+  );
 
   return { active, recentCompleted };
 }
+
 
 /** Why `POST /api/activity/retry` refused. Shared by the route and the activity
  *  feed so both sides compare against the same literals — a hand-written string

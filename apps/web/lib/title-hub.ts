@@ -7,6 +7,7 @@ import {
   queueTrackingInitialization,
   type EpisodeStatusCell,
   type MediaTitle,
+  type ManualResourceSelection,
   type PreparedSeriesTarget,
 } from "@media-track/workflow";
 import { findDemoCandidateByTmdbId } from "./demo-candidates";
@@ -109,7 +110,7 @@ function getDurableTargetCache(): DurableJsonCache {
  * Live TMDB when configured (cached 6h per title), demo candidates otherwise,
  * null when the title is unknown to both.
  */
-async function seriesTargetFor(tmdbId: number): Promise<PreparedSeriesTarget | null> {
+export async function seriesTargetFor(tmdbId: number): Promise<PreparedSeriesTarget | null> {
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER === "tmdb") {
     const cached = seriesTargetCache.get(tmdbId);
     if (cached && cached.expiresAt > Date.now()) {
@@ -339,9 +340,14 @@ export async function queueSeasonTracking(
   tmdbId: number,
   seasonNumber: number,
   storageId?: string,
+  manualSelection?: ManualResourceSelection,
 ): Promise<CandidateTrackingRequestResult> {
   const scope = await getActiveWorkspaceScope(storageId);
-  return queueCandidateTracking(`tmdb_tv_${tmdbId}_s${seasonNumber}`, scope.connectedStorageId);
+  return queueCandidateTracking(
+    `tmdb_tv_${tmdbId}_s${seasonNumber}`,
+    scope.connectedStorageId,
+    manualSelection,
+  );
 }
 
 /**
@@ -353,6 +359,7 @@ export async function queueSeasonTracking(
 export async function queueRemainingSeasons(
   tmdbId: number,
   storageId?: string,
+  manualSelection?: ManualResourceSelection,
 ): Promise<CandidateTrackingRequestResult> {
   const repository = getWorkflowRepository();
   const scope = await getActiveWorkspaceScope(storageId);
@@ -383,6 +390,7 @@ export async function queueRemainingSeasons(
     repository,
     accountId: scope.accountId,
     connectedStorageId: scope.connectedStorageId,
+    ...(manualSelection ? { manualSelection } : {}),
   });
   return {
     status: request.status === "queued" ? "queued" : request.status,

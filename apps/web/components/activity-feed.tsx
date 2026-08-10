@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { CheckCircle2, ChevronDown, ChevronRight, Clock3, Loader2, RotateCcw, TriangleAlert, X } from "lucide-react";
+import { CheckCircle2, ChevronDown, ChevronRight, Clock3, Loader2, RotateCcw, Search, TriangleAlert, X } from "lucide-react";
 import { showHref } from "@media-track/workflow/scope";
 import type {
   ActivityActiveRun,
@@ -249,7 +249,13 @@ function CompletedRow({ item }: { item: ActivityCompletedItem }) {
           {completedPillLabel(item.status)}
         </span>
         {item.sizeText ? <span className="act-sub">{item.sizeText}</span> : null}
-        {failed ? <RetryButton runId={item.workflowRunId} title={item.title} /> : null}
+        {item.reselectHref ? (
+          <Link className="act-retry" href={item.reselectHref}>
+            <Search size={13} aria-hidden /> 重新选择
+          </Link>
+        ) : failed ? (
+          <RetryButton runId={item.workflowRunId} title={item.title} />
+        ) : null}
       </div>
     </div>
   );

@@ -110,7 +110,7 @@ async function HomeSurface({
             <div className="search-hero">
               <div>
                 <h1>搜索</h1>
-                <p>找到目标后发起获取，后台会处理资源判断、转存和验证。</p>
+                <p>找到目标后先查看全部资源候选，按匹配度和偏好排序，再由你决定保存哪一条。</p>
               </div>
               <SearchForm basePath={basePath} defaultQuery={query} />
             </div>

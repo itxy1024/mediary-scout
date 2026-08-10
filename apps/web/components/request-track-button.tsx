@@ -17,6 +17,7 @@ import { isDemoModeClient } from "../lib/demo-mode";
 import { DemoAcquirePlayback } from "./demo-acquire-playback";
 import type { DemoAcquisitionEntry } from "../lib/demo-session";
 import { useDemoAcquiredTmdbIds } from "../lib/use-demo-session";
+import { resourcePickerHref } from "../lib/resource-picker-link";
 
 /**
  * Acquire control for a movie candidate. Visual states, kept consistent with
@@ -131,6 +132,10 @@ export function RequestTrackButton({
         onClick={() => {
           if (demo) {
             setDemoPlaying(true);
+            return;
+          }
+          if (actionState !== "can_reserve" && tmdbId != null) {
+            router.push(resourcePickerHref({ kind: "movie", tmdbId, ...(storageId ? { storageId } : {}) }));
             return;
           }
           startTransition(async () => {

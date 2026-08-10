@@ -33,6 +33,7 @@ import {
 } from "./runner-v2.js";
 import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import { isTianyiAuthError } from "./tianyi-client.js";
+import { resourceProviderForManualSelection } from "./manual-resource-selection.js";
 
 /** Brand netdisk auth failures only — never LLM Unauthorized / plain Errors. */
 function isBrandStorageAuthError(error: unknown): boolean {
@@ -331,7 +332,14 @@ export async function runQueuedType2Workflow(input: {
           deps.animeStorageParentDirectoryId,
         ),
       ),
-      resourceProvider: deps.resourceProvider,
+      resourceProvider: resourceProviderForManualSelection({
+        snapshots: claimed.resourceSnapshots,
+        auditEvents: claimed.workflowRun.auditEvents,
+        fallback: deps.resourceProvider,
+      }),
+      priorObtained: claimed.episodes
+        .filter((episode) => episode.obtained)
+        .map((episode) => episode.episodeCode),
       storage: deps.storage,
       model: deps.model,
       repository: input.repository,
@@ -832,7 +840,11 @@ export async function runQueuedMovieAcquisition(input: {
       title: claimed.title,
       categoryParentId:
         deps.moviesParentDirectoryId ?? input.moviesParentDirectoryId,
-      resourceProvider: deps.resourceProvider,
+      resourceProvider: resourceProviderForManualSelection({
+        snapshots: claimed.resourceSnapshots,
+        auditEvents: claimed.workflowRun.auditEvents,
+        fallback: deps.resourceProvider,
+      }),
       storage: deps.storage,
       model: deps.model,
       repository: input.repository,
@@ -921,6 +933,15 @@ export async function runQueuedSeriesInitialization(input: {
         "Queued series initialization run is missing its season metadata",
       );
     }
+    const priorStates = await input.repository.listTrackedSeasonStates({
+      accountId: claimed.accountId,
+      connectedStorageId: claimed.connectedStorageId,
+    });
+    const priorObtained = priorStates
+      .filter((state) => state.title.id === claimed.title.id)
+      .flatMap((state) => state.episodes)
+      .filter((episode) => episode.obtained)
+      .map((episode) => episode.episodeCode);
     const result = await runSeriesInitializationV2AndPersist({
       title: claimed.title,
       seasons,
@@ -932,7 +953,12 @@ export async function runQueuedSeriesInitialization(input: {
         ),
       ),
       seasonQualityRecord: claimed.season.qualityPreference,
-      resourceProvider: deps.resourceProvider,
+      resourceProvider: resourceProviderForManualSelection({
+        snapshots: claimed.resourceSnapshots,
+        auditEvents: claimed.workflowRun.auditEvents,
+        fallback: deps.resourceProvider,
+      }),
+      priorObtained,
       storage: deps.storage,
       model: deps.model,
       repository: input.repository,

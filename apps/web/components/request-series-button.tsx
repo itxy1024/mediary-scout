@@ -1,14 +1,13 @@
 "use client";
 
-import { Check, Layers, LoaderCircle } from "lucide-react";
-import { useState, useTransition } from "react";
-import { requestSeriesAction, type RequestTrackingActionResult } from "../app/actions";
-import { runAction } from "../lib/run-action";
-import { AcquireResultNotice, isLockedResult } from "./request-state";
+import { Check, Layers } from "lucide-react";
+import { useState } from "react";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { DemoAcquirePlayback } from "./demo-acquire-playback";
 import type { DemoAcquisitionEntry } from "../lib/demo-session";
 import { useDemoAcquiredTmdbIds } from "../lib/use-demo-session";
+import { useRouter } from "next/navigation";
+import { resourcePickerHref } from "../lib/resource-picker-link";
 
 export function RequestSeriesButton({
   candidateId,
@@ -22,9 +21,7 @@ export function RequestSeriesButton({
   /** Demo only: recorded to the session library when the scripted playback ends. */
   demoEntry?: DemoAcquisitionEntry | undefined;
 }) {
-  const [isPending, startTransition] = useTransition();
-  const [result, setResult] = useState<RequestTrackingActionResult | null>(null);
-  const isLocked = isLockedResult(result);
+  const router = useRouter();
   // Read-only demo: clicking plays the scripted playback (the server action is gated).
   const demo = isDemoModeClient();
   const [demoPlaying, setDemoPlaying] = useState(false);
@@ -44,35 +41,23 @@ export function RequestSeriesButton({
   }
 
   return (
-    <>
       <button
         className="primary-button series-button"
         type="button"
-        title={result?.message ?? "获取全部季"}
-        disabled={isPending || isLocked}
+        title="检索全剧资源"
         onClick={() => {
           if (demo) {
             setDemoPlaying(true);
             return;
           }
-          startTransition(async () => {
-            const r = await runAction(
-              () => requestSeriesAction({ candidateId, storageId }),
-              (msg) => setResult({ status: "unsupported", message: msg }),
-            );
-            if (!r.ok) return;
-            setResult(r.value);
-          });
+          const tmdbId = Number(/^tmdb_tv_(\d+)/.exec(candidateId)?.[1]);
+          if (Number.isInteger(tmdbId) && tmdbId > 0) {
+            router.push(resourcePickerHref({ kind: "series", tmdbId, ...(storageId ? { storageId } : {}) }));
+          }
         }}
       >
-        {isPending || isLocked ? (
-          <LoaderCircle size={14} className="spin" aria-hidden />
-        ) : (
-          <Layers size={14} aria-hidden />
-        )}
-        {isLocked ? "已请求" : "获取全剧"}
+        <Layers size={14} aria-hidden />
+        获取全剧
       </button>
-      <AcquireResultNotice result={result} />
-    </>
   );
 }
