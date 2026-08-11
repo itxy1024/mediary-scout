@@ -176,8 +176,8 @@ if [ "${UP_FAILED:-}" = "1" ]; then
     echo "" >&2
     echo "❌ 拉取容器镜像失败 —— 这不是你的配置错了,是 Docker Hub 在中国大陆常年不稳定。" >&2
     echo "" >&2
-    echo "   在当前目录的 .env 里加一行镜像源,然后重跑本命令:" >&2
-    echo "     echo 'DOCKER_MIRROR=docker.1ms.run' >> .env" >&2
+    echo "   请给 Docker daemon 配置 registry-mirrors,重启 Docker 后再运行本命令。" >&2
+    echo "   Docker Desktop:Settings → Docker Engine;Linux:/etc/docker/daemon.json" >&2
     echo "" >&2
     echo "   已实测可用(公共镜像站会轮流失效,一个不通就换下一个):" >&2
     echo "     docker.1ms.run · dockerproxy.net · docker.m.daocloud.io · hub.rat.dev" >&2
@@ -185,13 +185,9 @@ if [ "${UP_FAILED:-}" = "1" ]; then
     echo "   验证某个站是否可用:" >&2
     echo "     docker pull docker.1ms.run/cloudflare/cloudflared:latest" >&2
     echo "" >&2
-    # 老版本部署文件里 image 是硬编码的,加了变量也不生效 —— 必须点出来,
-    # 否则用户会照做却毫无变化,然后彻底放弃。
-    if ! grep -q 'DOCKER_MIRROR' docker-compose.y*ml 2>/dev/null; then
-      echo "   ⚠️ 你的 docker-compose.yml 还不支持 DOCKER_MIRROR(旧版本)。" >&2
-      echo "      先更新部署文件(git pull 或重新下载),再设这个变量。" >&2
-      echo "" >&2
-    fi
+    echo "   注意:.env 的 DOCKER_MIRROR 只供手动 docker build 使用," >&2
+    echo "   不会改写当前 docker-compose.yml 中的 image 地址。" >&2
+    echo "" >&2
     echo "   TUNNEL_TOKEN 已写入 .env,备份在 $BACKUP —— 重跑时无需再取新码。" >&2
     exit 1
   fi

@@ -2,31 +2,31 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
 /**
- * Docker Hub 镜像源支持的护栏。
+ * Docker 镜像策略的契约测试。
  *
- * 背景:本项目主要面向中国大陆用户,而 **Docker Hub 在大陆经常不可达**
- * (`failed to fetch anonymous token: ... EOF` / `connection reset by peer`)。
- * 作者实测:重试十余次全失败,换公共镜像站一次成功。
- *
- * 三个 Docker Hub 镜像(postgres / node / cloudflared)必须都能被同一个
- * DOCKER_MIRROR 变量改写。**漏掉任何一个,用户的表现是「拉了两个成功、
- * 第三个卡住」,而报错发生在流程末尾(最费时间),很难联想到是同一个原因。**
+ * Compose 面向普通用户,直接拉取发布到 GHCR 的 web 成品镜像。
+ * Dockerfile 面向源码构建,继续通过 DOCKER_MIRROR 支持国内镜像源。
  */
-describe("DOCKER_MIRROR 覆盖全部 Docker Hub 镜像", () => {
+describe("Docker 镜像策略", () => {
   const root = new URL("../../../", import.meta.url);
   const compose = readFileSync(new URL("docker-compose.yml", root), "utf8");
   const dockerfile = readFileSync(new URL("Dockerfile", root), "utf8");
   const envExample = readFileSync(new URL(".env.example", root), "utf8");
+  const deploySh = readFileSync(new URL("scripts/deploy.sh", root), "utf8");
   const connectSh = readFileSync(new URL("assets/connect.sh", import.meta.url.replace(/src\/[^/]+$/, "")), "utf8");
 
-  it("compose 里的 postgres 与 cloudflared 都走变量", () => {
-    for (const img of ["postgres:16-alpine", "cloudflare/cloudflared:latest"]) {
-      const line = compose.split("\n").find((l) => l.includes(`image:`) && l.includes(img));
-      expect(line, `没找到 ${img} 的 image 行`).toBeDefined();
-      expect(line, `${img} 没有走 DOCKER_MIRROR —— 墙内用户会卡在这个镜像`).toContain(
-        "DOCKER_MIRROR",
-      );
-    }
+  it("compose 直接拉取发布的 web 成品镜像", () => {
+    expect(compose).toContain("image: ghcr.io/itxy1024/mediary-scout:latest");
+    expect(compose).toContain("pull_policy: always");
+  });
+
+  it("compose 不强制要求仓库根目录存在 .env", () => {
+    expect(compose).toMatch(/env_file:\s*\n\s*- path: \.env\s*\n\s*required: false/);
+  });
+
+  it("升级脚本拉取 web 成品镜像而不是调用 compose build", () => {
+    expect(deploySh).toContain("docker compose pull web");
+    expect(deploySh).not.toContain("docker compose build web");
   });
 
   it("Dockerfile 的 node 基础镜像走变量,且**两个阶段都声明了 ARG**", () => {
@@ -38,14 +38,7 @@ describe("DOCKER_MIRROR 覆盖全部 Docker Hub 镜像", () => {
     expect(dockerfile.match(/^ARG DOCKER_MIRROR$/gm)?.length).toBe(froms.length);
   });
 
-  it("compose 自动把 DOCKER_MIRROR 传进 build args", () => {
-    // 不传的话用户还得记得手敲 --build-arg,漏了就只有 build 阶段失败。
-    expect(compose).toMatch(/DOCKER_MIRROR:\s*\$\{DOCKER_MIRROR:-\}/);
-  });
-
-  it("默认值为空 —— 境外用户零影响", () => {
-    // ${VAR:+...} 语法:非空才加前缀。默认必须展开成官方镜像名。
-    expect(compose).toContain("${DOCKER_MIRROR:+");
+  it("手动源码构建的镜像源默认值为空", () => {
     expect(dockerfile).toContain("${DOCKER_MIRROR:+");
     expect(envExample).toMatch(/^DOCKER_MIRROR=$/m);
   });
@@ -56,14 +49,13 @@ describe("DOCKER_MIRROR 覆盖全部 Docker Hub 镜像", () => {
     expect(line).not.toContain("DOCKER_MIRROR");
   });
 
-  it("connect.sh 能识别真实的 Docker Hub 报错并给出解法", () => {
+  it("connect.sh 能识别 Docker Hub 报错并给出适用于当前 compose 的解法", () => {
     // 这三条是作者今晚实际遇到的原始报错。
-    expect(connectSh).toContain("DOCKER_MIRROR");
     for (const pat of ["fetch anonymous token", "connection reset by peer", "resolve reference"]) {
       expect(connectSh, `诊断分支漏了 ${pat}`).toContain(pat);
     }
-    // 必须点出「旧版 compose 不支持这个变量」——否则用户照做却毫无变化。
-    expect(connectSh).toContain("旧版本");
+    expect(connectSh).toContain("registry-mirrors");
+    expect(connectSh).toContain("不会改写当前 docker-compose.yml");
   });
 
   it("**生成产物 assets.gen.ts 与源文件同步**(我今晚漏过这一步)", () => {
@@ -73,7 +65,7 @@ describe("DOCKER_MIRROR 覆盖全部 Docker Hub 镜像", () => {
     // 我今晚就是这么漏的:改完 connect.sh、提交、部署、自检通过,
     // 然后 curl 线上发现新内容一个字都没有。
     const gen = readFileSync(new URL("html/assets.gen.ts", import.meta.url), "utf8");
-    for (const pat of ["DOCKER_MIRROR", "fetch anonymous token", "旧版本"]) {
+    for (const pat of ["registry-mirrors", "fetch anonymous token", "不会改写当前 docker-compose.yml"]) {
       expect(gen, `assets.gen.ts 缺 ${pat} —— 忘了跑 generate-content.mjs?`).toContain(pat);
     }
   });

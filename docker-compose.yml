@@ -1,27 +1,9 @@
-# media-track 自部署:一把拉起 web(Next + 进程内 worker) / Postgres / PanSou。
-#   docker compose up -d   →   打开 http://<host>:3000   →   设置页扫码连 115 即用
-# TMDB 经 §1 CF Worker 开箱即用;LLM key / 自己的 TMDB key / Prowlarr 在设置页填。
-# ---- Docker Hub 镜像源(墙内必读) ----
-#
-# 本文件里三个镜像来自 Docker Hub:postgres、node(见 Dockerfile)、cloudflared。
-# **在中国大陆,Docker Hub 经常拉不动** —— 表现为
-# `failed to fetch anonymous token: ... EOF` 或 `connection reset by peer`。
-# 这不是你的配置错了,是 registry-1.docker.io / auth.docker.io 不可达。
-#
-# 解决:在 .env 里设一个镜像源前缀,三处会一起生效:
-#
-#   DOCKER_MIRROR=docker.1ms.run
-#
-# 已实测可用(2026-08-01,大陆直连):
-#   docker.1ms.run  ·  dockerproxy.net  ·  docker.m.daocloud.io  ·  hub.rat.dev
-# 换一个不通就换下一个 —— 公共镜像站会轮流失效,别只记住一个。
-#
-# 留空(默认)= 直连 Docker Hub 官方,境外网络无需任何设置。
-# 注意 pansou 走的是 ghcr.io,**不受此变量影响**(ghcr 在墙内通常可直连)。
-#
-# build 阶段(Dockerfile 里的 node 基础镜像)要同一个值:
-#   docker compose build --build-arg DOCKER_MIRROR=docker.1ms.run web
-# 或者更省事:把 DOCKER_MIRROR 写进 .env,compose 会自动传给 build args。
+# media-track 自部署:直接拉取 web 成品镜像,并启动 Postgres / PanSou。
+#   docker compose up -d   →   打开 http://<host>:13000   →   设置页扫码连接网盘
+# web 与 PanSou 来自 ghcr.io;Postgres 与 cloudflared 来自 Docker Hub。
+# 中国大陆拉取 Docker Hub 失败时,请配置 Docker daemon 的 registry-mirrors;
+# .env 中的 DOCKER_MIRROR 仅供手动执行 docker build --build-arg 使用,
+# 不会改写本 Compose 文件里的 image 地址。
 
 name: mediary-scout
 
@@ -53,7 +35,8 @@ services:
     ports:
       - "8890:80"
     env_file:
-      - ./.env
+      - path: .env
+        required: false
     logging: *default-logging
     restart: unless-stopped
 

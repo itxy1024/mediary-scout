@@ -47,13 +47,13 @@ Mediary Scout 有两种部署方式:
 
 ```bash
 git clone https://github.com/fancydirty/mediary-scout && cd mediary-scout
-docker compose up -d        # 首次会构建 web 镜像,几分钟
+docker compose up -d        # 首次会拉取 web 成品镜像和依赖服务
 ```
 
 > ### ⚠️ 墙内先看这个:Docker Hub 大概率拉不动
 >
-> 本项目有三个镜像来自 Docker Hub(`postgres`、构建 web 用的 `node`、`cloudflared`),
-> 而 **Docker Hub 在中国大陆常年不稳定**。典型报错:
+> Compose 会从 Docker Hub 拉取 `postgres` 和 `cloudflared`,从 GHCR 拉取 `web` 和
+> `pansou`,而 **Docker Hub 在中国大陆常年不稳定**。典型报错:
 >
 > ```
 > failed to fetch anonymous token: Get "https://auth.docker.io/token...": EOF
@@ -61,15 +61,15 @@ docker compose up -d        # 首次会构建 web 镜像,几分钟
 > read: connection reset by peer
 > ```
 >
-> **这不是你配置错了,重试也没用**(作者实测重试十余次全失败)。在仓库根 `.env` 里
-> 加一行镜像源,三处会一起生效:
+> **这不是你配置错了,重试也没用**。请给 Docker daemon 配置 `registry-mirrors`,
+> 重启 Docker 后再启动 Compose。Docker Desktop 在 **Settings → Docker Engine** 中修改;
+> Linux / NAS 修改 `/etc/docker/daemon.json`。示例:
 >
-> ```bash
-> echo 'DOCKER_MIRROR=docker.1ms.run' >> .env
-> docker compose up -d
+> ```json
+> { "registry-mirrors": ["https://docker.1ms.run"] }
 > ```
 >
-> 已实测可用(2026-08-01,大陆直连,四个都能拉到全部三个镜像):
+> 已实测可用的候选镜像源(2026-08-01,大陆直连):
 >
 > | 镜像源 | 备注 |
 > |---|---|
@@ -78,17 +78,14 @@ docker compose up -d        # 首次会构建 web 镜像,几分钟
 > | `docker.m.daocloud.io` | |
 > | `hub.rat.dev` | |
 >
-> **公共镜像站会轮流失效 —— 一个不通就换下一个,别只记住一个。** 验证某站可用:
+> **公共镜像站会轮流失效 —— 一个不通就换下一个,别只记住一个。** 配置后重新运行:
 >
 > ```bash
-> docker pull docker.1ms.run/library/node:22-slim
+> docker compose up -d
 > ```
 >
-> 留空(默认)= 直连 Docker Hub 官方,**境外网络无需任何设置**。
-> `pansou` 走 `ghcr.io`,不受此变量影响(墙内通常可直连)。
->
-> 另一条路是给 Docker daemon 配全局 `registry-mirrors`(`/etc/docker/daemon.json`),
-> 效果一样。`DOCKER_MIRROR` 的好处是只影响本项目、不需要 root、不用重启 daemon。
+> `.env` 中的 `DOCKER_MIRROR` 只供手动源码构建时作为 `--build-arg` 使用,
+> 不会改写当前 Compose 的 `image` 地址。境外网络通常无需配置镜像源。
 
 打开 `http://<你的主机>:3000`:
 1. **设置 → 网盘**:在品牌瓦片里选一个开始连接——115 / 夸克 / 天翼 / 123 扫码登录,光鸭粘贴 token(见各品牌连接小节);凭证入库后自动用于转存。五个品牌可各绑一块盘,互为独立工作区。
@@ -290,8 +287,8 @@ c. 进这条隧道的 Public Hostname → Add a public hostname:
 - 在部署目录执行 `docker compose --profile tunnel up -d`
 - 首次会拉取 cloudflared 镜像(慢网络几分钟,正常)。
   **墙内若报 `failed to fetch anonymous token` / `connection reset by peer`,重试没用** ——
-  那是 Docker Hub 常年不稳定,在 `.env` 里加 `DOCKER_MIRROR=docker.1ms.run` 再重跑
-  (见上方「Compose 快速开始」里的镜像源小节)。`connect.sh` 遇到这个错会直接把解法打出来。
+  那是 Docker Hub 常年不稳定,请配置 Docker daemon 的 `registry-mirrors` 后再重跑
+  (见上方「Compose 快速开始」里的镜像源小节)。`connect.sh` 遇到这个错会直接给出该解法。
 
 第 4 步·确认连通:
 1. 先 `docker compose ps cloudflared` 应显示 Up(若 Starting/空,等 30 秒再看,别判失败)。
@@ -356,7 +353,10 @@ Public Hostname 与 Access 已由 Connect 控制面配好，服务目标固定�
 
 ## 国内构建加速(Docker Hub 常年不稳定)
 
-Docker Hub 和 ghcr 在国内常年不稳定,首次 `docker compose up` 构建 / 拉取会卡住。下面的镜像加速**只解决 Docker Hub**(占绝大多数镜像);来自 ghcr 的 `pansou` 是例外,见本节末尾。典型报错(任一即是此问题):
+Docker Hub 和 ghcr 在国内常年不稳定。当前 Compose 会直接拉取成品镜像,其中
+`postgres`、`cloudflared` 来自 Docker Hub,`web`、`pansou` 来自 GHCR。
+下面的 `registry-mirrors` **只解决 Docker Hub**;GHCR 的处理方式见本节末尾。
+典型报错(任一即是此问题):
 
 ```
 failed to fetch oauth token: Post "https://auth.docker.io/token": ... i/o timeout
@@ -380,12 +380,15 @@ DeadlineExceeded / dial tcp ...:443: i/o timeout
 { "registry-mirrors": ["https://docker.1ms.run"] }
 ```
 
-**npm 也慢的话**,构建时换国内源:
+如果需要手动从源码构建 web,可同时指定 Docker Hub 和 npm 镜像源:
 ```bash
-docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
+docker build \
+  --build-arg DOCKER_MIRROR=docker.1ms.run \
+  --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
+  -t mediary-scout:local .
 ```
 
-> 镜像地址会失效/限速,`docker.1ms.run` 只是示例;搜「Docker 镜像加速 可用」找当前能用的即可。配好后,所有 **Docker Hub** 镜像(`postgres`、构建 web 用的 `node`、`cloudflared`)都会走镜像 —— 本仓库 Dockerfile 已**特意不写 `# syntax=` 指令**,避免它绕过镜像、第一步就卡死(见 #46)。
+> 镜像地址会失效/限速,`docker.1ms.run` 只是示例;搜「Docker 镜像加速 可用」找当前能用的即可。Docker daemon 的 `registry-mirrors` 负责 Compose 拉取的 `postgres`、`cloudflared`;手动构建时的 `DOCKER_MIRROR` build arg 负责 Dockerfile 中的 `node`。本仓库 Dockerfile 已**特意不写 `# syntax=` 指令**,避免它绕过镜像、第一步就卡死(见 #46)。
 
 **⚠️ 注意 `pansou` 例外**:它来自 **ghcr.io**(`ghcr.io/fish2018/pansou-web`),而 Docker 的 `registry-mirrors` **只对 Docker Hub 生效、管不到 ghcr**。若 ghcr 也连不上,二选一:
 - 在 `.env` 设 `PANSOU_IMAGE=` 指向一个 ghcr 镜像/代理(如 `ghcr.nju.edu.cn/fish2018/pansou-web:latest`,镜像可用性自行确认),再 `docker compose up -d`;
@@ -399,16 +402,15 @@ docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 ./scripts/deploy.sh
 ```
 
-`scripts/deploy.sh` 会 `git pull` → 重建 `web` → `up -d` → **验证跑起来的容器确实是刚拉取的 commit**(读容器内 `BUILD_COMMIT` 和 `HEAD` 比对,不一致直接报错退出)。等价于 `docker compose up -d --build`,但多了那道**自校验**,并且不用 `--no-cache`。
+`scripts/deploy.sh` 会 `git pull` → 拉取最新 `web` 成品镜像 → `up -d` → **验证运行容器与仓库处于同一 commit**(读取容器内 `BUILD_COMMIT` 与 `HEAD` 比对,不一致直接报错退出)。
 
-> **为什么要自校验?** 升级最阴的失败是**静默回退**:`git pull` 之后容器仍在跑**旧代码**,而所有常规信号都在骗你——宿主 `git rev-parse HEAD` 显示的是新 commit(和容器里实际跑的代码无关),盯镜像 hash 也没用(`--no-cache` 重建每次 hash 都不同,纯粹是构建不确定性)。#88–#98 就是这样连续五次「部署成功」实则一整天跑旧代码。所以真正的护栏不是缓存技巧,而是**一道检查**:把镜像构建时刻的 commit 盖进 `BUILD_COMMIT`,部署后比对运行容器的 `BUILD_COMMIT` 是否等于 `HEAD`,不等就报错——无论病根是构建缓存、`git pull` 空转、还是容器没被重建,都会当场暴露而非静默溜过。
->
-> `deploy.sh` 顺带传 `GIT_SHA=$(git rev-parse HEAD)` 作构建参数,Dockerfile 用它在 `COPY . .` 前触发缓存失效(ARG 在**首次使用**时 cache-miss,连带其后各层重建),每换 commit 强制重传源码 + 重建,而慢的 `npm ci` 依赖层仍走缓存。**不必 `--no-cache`**(那会把依赖层也丢掉,慢几分钟)。装了 buildx / 用内置 BuildKit 的宿主本就内容寻址、`COPY` 可靠,这层主要是给用**经典构建器**(`DOCKER_BUILDKIT=0` 或很老的 Docker)的自部署者兜底;两种构建器下都正确无副作用。
+> **为什么要自校验?** `git pull` 完成并不代表 GHCR 的 `latest` 镜像已经构建完成,容器也可能因为拉取或重建异常继续运行旧代码。发布镜像内写有 `BUILD_COMMIT`;脚本将它与仓库 `HEAD` 比较,不一致时明确失败并提示等待 CI 完成后重试。
 >
 > 手动等价执行 + 校验:
 > ```bash
 > git pull --ff-only
-> GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
+> docker compose pull web
+> docker compose up -d
 > # 核对容器真在跑新代码(应等于上面的 HEAD):
 > docker compose exec web cat BUILD_COMMIT
 > ```
