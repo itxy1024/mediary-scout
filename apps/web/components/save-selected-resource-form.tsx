@@ -1,38 +1,56 @@
 "use client";
 
 import { Check, LoaderCircle } from "lucide-react";
-import { useActionState, useEffect } from "react";
+import { type FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
-import {
-  initialSaveSelectedResourceState,
-  saveSelectedResourceAction,
-} from "../app/resources/select/actions";
+import type { SaveSelectedResourceResult } from "../lib/save-selected-resource";
 
 export function SaveSelectedResourceForm({ token, storageId }: { token: string; storageId?: string }) {
   const router = useRouter();
-  const [state, action, pending] = useActionState(
-    saveSelectedResourceAction,
-    initialSaveSelectedResourceState,
-  );
+  const [state, setState] = useState<SaveSelectedResourceResult | null>(null);
+  const [pending, setPending] = useState(false);
 
-  useEffect(() => {
-    if (state.status !== "queued") return;
-    const query = storageId ? `?w=${encodeURIComponent(storageId)}` : "";
-    router.push(`/activity${query}`);
-  }, [router, state.status, storageId]);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (pending) return;
+    setPending(true);
+    setState(null);
+    try {
+      const response = await fetch("/api/resources/select", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      const result = (await response.json().catch(() => null)) as SaveSelectedResourceResult | null;
+      if (!result || (result.status !== "queued" && result.status !== "error")) {
+        throw new Error("服务器返回了无法识别的结果，请稍后重试。");
+      }
+      setState(result);
+      if (result.status === "queued") {
+        const query = storageId ? `?w=${encodeURIComponent(storageId)}` : "";
+        router.push(`/activity${query}`);
+      }
+    } catch (error) {
+      setState({
+        status: "error",
+        message: error instanceof Error ? error.message : "保存失败，请稍后重试。",
+      });
+    } finally {
+      setPending(false);
+    }
+  }
 
   return (
-    <form action={action} className="resource-save-form">
-      <input type="hidden" name="token" value={token} />
-      <button className="primary-button" type="submit" disabled={pending || state.status === "queued"}>
+    <form onSubmit={submit} className="resource-save-form">
+      <button className="primary-button" type="submit" disabled={pending || state?.status === "queued"}>
         {pending ? (
           <LoaderCircle size={15} className="spin" aria-hidden />
         ) : (
           <Check size={15} aria-hidden />
         )}
-        {pending ? "正在提交" : state.status === "queued" ? "已加入队列" : "保存此资源"}
+        {pending ? "正在提交" : state?.status === "queued" ? "已加入队列" : "保存此资源"}
       </button>
-      {state.status === "error" ? <p className="request-result">{state.message}</p> : null}
+      {state?.status === "error" ? <p className="request-result">{state.message}</p> : null}
     </form>
   );
 }
