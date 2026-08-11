@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { candidateDateLabel, candidateSourceLabel } from "./resource-candidate-view";
+import { candidateDateLabel, candidateSourceLabel, candidateTextLabel } from "./resource-candidate-view";
 
 describe("resource candidate view", () => {
   it("shows the PanSou plugin name and uses a truthful fallback source", () => {
@@ -11,5 +11,10 @@ describe("resource candidate view", () => {
   it("hides Go zero dates", () => {
     expect(candidateDateLabel("0001-01-01T00:00:00Z")).toBeNull();
     expect(candidateDateLabel("")).toBeNull();
+  });
+
+  it("only displays non-empty resource metadata", () => {
+    expect(candidateTextLabel(" 35.66 GB ")).toBe("35.66 GB");
+    expect(candidateTextLabel(undefined)).toBeNull();
   });
 });

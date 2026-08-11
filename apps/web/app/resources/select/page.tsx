@@ -1,9 +1,11 @@
-import { AlertTriangle, Database, Filter, HardDriveDownload, Languages } from "lucide-react";
+import { AlertTriangle, HardDriveDownload } from "lucide-react";
 import { connection } from "next/server";
 import { Suspense } from "react";
 import { AppSidebar } from "../../../components/app-sidebar";
 import { BackLink } from "../../../components/back-link";
 import { SaveSelectedResourceForm } from "../../../components/save-selected-resource-form";
+import { ResourceCandidateFilters } from "../../../components/resource-candidate-filters";
+import { ResourceSearchLoading } from "../../../components/resource-search-loading";
 import {
   getManualResourcePickerView,
   type ManualResourcePickerInput,
@@ -11,6 +13,7 @@ import {
 import {
   candidateDateLabel,
   candidateSourceLabel,
+  candidateTextLabel,
 } from "../../../lib/resource-candidate-view";
 
 export default function ResourceSelectPage({
@@ -29,7 +32,9 @@ function ResourceSelectShell() {
   return (
     <div className="app-shell">
       <AppSidebar active="search" />
-      <main className="main product-main" aria-busy="true" />
+      <main className="main product-main resource-picker-main" aria-busy="true">
+        <ResourceSearchLoading />
+      </main>
     </div>
   );
 }
@@ -63,22 +68,22 @@ async function ResourceSelectSurface({
               <div>
                 <h1>选择要保存的资源</h1>
                 <p>
-                  {view.title.title} · {view.scopeLabel} · 共 {view.items.length} 条候选
+                  {view.title.title} · {view.scopeLabel} · 共 {view.items.length} / {view.totalCandidateCount} 条候选
                 </p>
               </div>
             </div>
 
-            <div className="resource-picker-summary" aria-label="排序依据">
-              <span>
-                <Filter size={14} aria-hidden /> 按匹配度排序
-              </span>
-              <span>
-                <Languages size={14} aria-hidden /> 语言：{view.preferredLanguage ?? "不限"}
-              </span>
-              <span>
-                <Database size={14} aria-hidden /> 画质：{qualityLabel(view.qualityPreference)}
-              </span>
-            </div>
+            <ResourceCandidateFilters
+              {...(view.sourceFilter ? { sourceFilter: view.sourceFilter } : {})}
+              languageFilter={view.languageFilter}
+              qualityFilter={view.qualityFilter}
+              sort={view.sort}
+              sources={view.sources}
+            />
+
+            {view.duplicateCount > 0 ? (
+              <p className="resource-dedupe-note">已合并 {view.duplicateCount} 条名称和大小完全相同的重复发布。</p>
+            ) : null}
 
             {view.sourceWarning ? (
               <p className="resource-picker-warning" role="alert">
@@ -99,6 +104,12 @@ async function ResourceSelectSurface({
                       <div className="resource-result-meta">
                         <span>{resourceTypeLabel(item.candidate.type)}</span>
                         <span>{candidateSourceLabel(item.candidate.source, item.candidate.type)}</span>
+                        {candidateTextLabel(item.candidate.providerPayload["quality"]) ? (
+                          <span>{candidateTextLabel(item.candidate.providerPayload["quality"])}</span>
+                        ) : null}
+                        {candidateTextLabel(item.candidate.providerPayload["sizeText"]) ? (
+                          <span className="resource-size">{candidateTextLabel(item.candidate.providerPayload["sizeText"])}</span>
+                        ) : null}
                         {candidateDateLabel(item.candidate.providerPayload["datetime"]) ? (
                           <span>{candidateDateLabel(item.candidate.providerPayload["datetime"])}</span>
                         ) : null}
@@ -119,8 +130,12 @@ async function ResourceSelectSurface({
             ) : (
               <div className="quiet-state compact">
                 <HardDriveDownload size={22} aria-hidden />
-                <strong>没有可选资源</strong>
-                <span>没有检索到可用记录，或检索结果均为已知失效链接。</span>
+                <strong>{view.totalCandidateCount > 0 ? "没有符合筛选的资源" : "没有可选资源"}</strong>
+                <span>
+                  {view.totalCandidateCount > 0
+                    ? "请调整来源、语言或画质条件。"
+                    : "没有检索到可用记录，或检索结果均为已知失效链接。"}
+                </span>
               </div>
             )}
           </section>
@@ -156,11 +171,19 @@ function parsePickerInput(
   if (kind === "season" && (!Number.isInteger(seasonNumber) || seasonNumber <= 0)) {
     throw new Error("季参数无效。");
   }
+  const parsedSourceFilter = sourceFilter(params.source);
+  const parsedLanguageFilter = languageFilter(params.language);
+  const parsedQualityFilter = qualityFilter(params.quality);
+  const parsedSort = sortValue(params.sort);
   return {
     kind,
     tmdbId,
     ...(kind === "season" ? { seasonNumber } : {}),
     ...(storageId ? { storageId } : {}),
+    ...(parsedSourceFilter ? { sourceFilter: parsedSourceFilter } : {}),
+    ...(parsedLanguageFilter ? { languageFilter: parsedLanguageFilter } : {}),
+    ...(parsedQualityFilter ? { qualityFilter: parsedQualityFilter } : {}),
+    ...(parsedSort ? { sort: parsedSort } : {}),
   };
 }
 
@@ -168,10 +191,26 @@ function stringParam(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? "" : value ?? "";
 }
 
-function qualityLabel(value: "high" | "medium" | undefined): string {
-  if (value === "high") return "高（优先 4K）";
-  if (value === "medium") return "中（优先 1080P）";
-  return "不限";
+function sourceFilter(value: string | string[] | undefined): string | undefined {
+  const source = stringParam(value).trim();
+  return source && source !== "all" && source.length <= 512 ? source : undefined;
+}
+
+function languageFilter(value: string | string[] | undefined): "all" | "zh" | undefined {
+  const language = stringParam(value);
+  return language === "all" || language === "zh" ? language : undefined;
+}
+
+function qualityFilter(value: string | string[] | undefined): "all" | "high" | "medium" | undefined {
+  const quality = stringParam(value);
+  return quality === "all" || quality === "high" || quality === "medium" ? quality : undefined;
+}
+
+function sortValue(value: string | string[] | undefined): "match" | "newest" | "size_desc" | "size_asc" | undefined {
+  const sort = stringParam(value);
+  return sort === "match" || sort === "newest" || sort === "size_desc" || sort === "size_asc"
+    ? sort
+    : undefined;
 }
 
 function resourceTypeLabel(type: string): string {

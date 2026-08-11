@@ -49,6 +49,7 @@ export interface PanSouResourceProviderOptions {
 interface PanSouLinkFact {
   title: string;
   source: string;
+  sourceId: string;
   type: ResourceType;
   rawType: string;
   url: string;
@@ -148,6 +149,7 @@ export class PanSouResourceProvider implements ResourceProvider {
         password: fact.password,
         datetime: fact.datetime,
         rawType: fact.rawType,
+        ...(fact.sourceId ? { sourceId: fact.sourceId } : {}),
       },
     }));
 
@@ -213,6 +215,7 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
       continue;
     }
     const resultTitle = stringValue(result["title"]);
+    const sourceId = stringValue(result["unique_id"]).trim();
     const source = panSouResultSource(result);
     const resultDatetime = usablePanSouDatetime(result["datetime"]);
     const links = Array.isArray(result["links"]) ? result["links"] : [];
@@ -230,6 +233,7 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
       facts.push({
         title: stringValue(link["work_title"]).trim() || resultTitle,
         source,
+        sourceId,
         type,
         rawType,
         url,
@@ -288,6 +292,7 @@ function createSnapshotId(keyword: string, facts: PanSouLinkFact[], workflowRunI
       password: fact.password,
       datetime: fact.datetime,
       source: fact.source,
+      sourceId: fact.sourceId,
     })),
   });
   const hash = createHash("sha1").update(material).digest("hex").slice(0, 12);

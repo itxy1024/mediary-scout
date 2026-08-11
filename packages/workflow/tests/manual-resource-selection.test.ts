@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createManualSelectionEvidence,
+  dedupeManualResources,
+  filterManualResources,
   rankManualResources,
   resourceProviderForManualSelection,
+  sortManualResources,
   type ResourceCandidate,
 } from "../src/index.js";
 
@@ -38,6 +41,52 @@ describe("手动资源候选排序", () => {
       expect.arrayContaining(["片名匹配", "第 1 季匹配", "符合 1080P 偏好", "符合中文偏好"]),
     );
     expect(ranked.at(-1)?.candidate.id).toBe("wrong");
+  });
+
+  it("只合并同来源、同类型、同原名和同大小的重复发布", () => {
+    const first = candidate("first", "示例电影 2160P 中字", "magnet");
+    first.providerPayload = {
+      url: "magnet:?xt=urn:btih:first",
+      originalTitle: "示例电影.2026.2160P",
+      sizeText: "20 GB",
+    };
+    const duplicate = candidate("duplicate", "示例电影 2160P 中字", "magnet");
+    duplicate.providerPayload = {
+      url: "magnet:?xt=urn:btih:second",
+      originalTitle: "示例电影.2026.2160P",
+      sizeText: "20 GB",
+    };
+    const differentSize = candidate("different", "示例电影 2160P 中字", "magnet");
+    differentSize.providerPayload = {
+      url: "magnet:?xt=urn:btih:third",
+      originalTitle: "示例电影.2026.2160P",
+      sizeText: "35 GB",
+    };
+
+    expect(dedupeManualResources([first, duplicate, differentSize]).map((item) => item.id)).toEqual([
+      "first",
+      "different",
+    ]);
+  });
+
+  it("按中文和画质真正过滤，并支持按大小排序", () => {
+    const fourK = candidate("4k", "示例电影.2026.2160P.中文字幕", "magnet");
+    fourK.providerPayload = { url: "magnet:4k", sizeBytes: 30, quality: "4K蓝光" };
+    const fullHd = candidate("1080p", "示例电影.2026.1080P.RAW", "magnet");
+    fullHd.providerPayload = { url: "magnet:1080", sizeBytes: 10, quality: "1080P蓝光" };
+    const candidates = [fourK, fullHd];
+
+    expect(filterManualResources(candidates, { language: "zh", quality: "high" }).map((item) => item.id)).toEqual([
+      "4k",
+    ]);
+    const ranked = rankManualResources({
+      candidates,
+      target: { title: "示例电影", aliases: [], year: 2026, seasonNumbers: [] },
+    });
+    expect(sortManualResources(ranked, "size_asc").map((item) => item.candidate.id)).toEqual([
+      "1080p",
+      "4k",
+    ]);
   });
 });
 

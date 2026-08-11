@@ -3,14 +3,21 @@ import "server-only";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import {
+  dedupeManualResources,
   deadLinkKey,
+  filterManualResources,
   rankManualResources,
+  sortManualResources,
+  type ManualResourceLanguageFilter,
+  type ManualResourceQualityFilter,
   type ManualResourceSelection,
+  type ManualResourceSort,
   type ManualResourceTarget,
   type MediaTitle,
   type RankedManualResource,
   type ResourceCandidate,
 } from "@media-track/workflow";
+import { enrichLingjiResourceCandidates } from "./lingji-resource-metadata";
 import { seriesTargetFor } from "./title-hub";
 import {
   getAccountScopedSettings,
@@ -31,6 +38,10 @@ const TOKEN_TTL_MS = 30 * 60 * 1000;
 
 export interface ManualResourcePickerInput extends ManualResourceTarget {
   storageId?: string;
+  sourceFilter?: string;
+  languageFilter?: ManualResourceLanguageFilter;
+  qualityFilter?: ManualResourceQualityFilter;
+  sort?: ManualResourceSort;
 }
 
 export interface ManualResourcePickerItem extends RankedManualResource {
@@ -44,6 +55,13 @@ export interface ManualResourcePickerView {
   storageId?: string;
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  sourceFilter?: string;
+  languageFilter: ManualResourceLanguageFilter;
+  qualityFilter: ManualResourceQualityFilter;
+  sort: ManualResourceSort;
+  sources: Array<{ value: string; count: number }>;
+  totalCandidateCount: number;
+  duplicateCount: number;
   items: ManualResourcePickerItem[];
   sourceWarning?: string;
 }
@@ -99,25 +117,43 @@ export async function getManualResourcePickerView(
   const provider = await getWorkerResourceProvider(settings, drive.provider, accountId);
   const snapshot = await provider.search({ keyword: resolved.title.title });
   const deadKeys = new Set(await repository.listDeadLinkKeys());
-  const candidates = snapshot.candidates.filter((candidate) => {
+  const liveCandidates = snapshot.candidates.filter((candidate) => {
     const identity = deadLinkKey(String(candidate.providerPayload["url"] ?? ""));
     return !(identity && deadKeys.has(identity.key));
   });
+  const enrichedCandidates = await enrichLingjiResourceCandidates(liveCandidates);
+  const candidates = dedupeManualResources(enrichedCandidates);
   const [preferredLanguage, qualityPreference] = await Promise.all([
     getPreferredLanguage(settings),
     getQualityPreference(settings),
   ]);
-  const ranked = rankManualResources({
-    candidates,
+  const languageFilter = input.languageFilter ?? (preferredLanguage?.includes("中文") ? "zh" : "all");
+  const qualityFilter = input.qualityFilter ?? qualityPreference ?? "all";
+  const sort = input.sort ?? "match";
+  const sourceCounts = new Map<string, number>();
+  for (const candidate of candidates) {
+    sourceCounts.set(candidate.source, (sourceCounts.get(candidate.source) ?? 0) + 1);
+  }
+  const sources = [...sourceCounts.entries()].map(([value, count]) => ({ value, count }));
+  const sourceFilter = input.sourceFilter && sourceCounts.has(input.sourceFilter)
+    ? input.sourceFilter
+    : undefined;
+  const filteredCandidates = filterManualResources(candidates, {
+    ...(sourceFilter ? { source: sourceFilter } : {}),
+    language: languageFilter,
+    quality: qualityFilter,
+  });
+  const ranked = sortManualResources(rankManualResources({
+    candidates: filteredCandidates,
     target: {
       title: resolved.title.title,
       aliases: [resolved.title.originalTitle, ...resolved.title.aliases].filter(Boolean),
       year: resolved.title.year,
       seasonNumbers: resolved.seasonNumbers,
     },
-    ...(preferredLanguage ? { preferredLanguage } : {}),
-    ...(qualityPreference ? { qualityPreference } : {}),
-  });
+    ...(languageFilter === "zh" ? { preferredLanguage: "中文" } : {}),
+    ...(qualityFilter !== "all" ? { qualityPreference: qualityFilter } : {}),
+  }), sort);
 
   const items = await Promise.all(
     ranked.map(async (item) => ({
@@ -147,6 +183,13 @@ export async function getManualResourcePickerView(
     ...(input.storageId ? { storageId: input.storageId } : {}),
     ...(preferredLanguage ? { preferredLanguage } : {}),
     ...(qualityPreference ? { qualityPreference } : {}),
+    ...(sourceFilter ? { sourceFilter } : {}),
+    languageFilter,
+    qualityFilter,
+    sort,
+    sources,
+    totalCandidateCount: candidates.length,
+    duplicateCount: liveCandidates.length - candidates.length,
     items,
     ...(sourceWarning ? { sourceWarning } : {}),
   };

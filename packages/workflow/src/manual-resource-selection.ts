@@ -31,6 +31,79 @@ export interface RankedManualResource {
   reasons: string[];
 }
 
+export type ManualResourceLanguageFilter = "all" | "zh";
+export type ManualResourceQualityFilter = "all" | "high" | "medium";
+export type ManualResourceSort = "match" | "newest" | "size_desc" | "size_asc";
+
+export function dedupeManualResources(candidates: ResourceCandidate[]): ResourceCandidate[] {
+  const seenUrls = new Set<string>();
+  const seenReleases = new Set<string>();
+  const deduped: ResourceCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const url = stringPayload(candidate.providerPayload["url"]);
+    if (url && seenUrls.has(url)) continue;
+    if (url) seenUrls.add(url);
+
+    const originalTitle = stringPayload(candidate.providerPayload["originalTitle"]);
+    const sizeText = stringPayload(candidate.providerPayload["sizeText"]);
+    const releaseKey = originalTitle && sizeText
+      ? [candidate.source, candidate.type, compactText(originalTitle), normalize(sizeText)].join("|")
+      : "";
+    if (releaseKey && seenReleases.has(releaseKey)) continue;
+    if (releaseKey) seenReleases.add(releaseKey);
+    deduped.push(candidate);
+  }
+
+  return deduped;
+}
+
+export function filterManualResources(
+  candidates: ResourceCandidate[],
+  filters: {
+    source?: string;
+    language: ManualResourceLanguageFilter;
+    quality: ManualResourceQualityFilter;
+  },
+): ResourceCandidate[] {
+  return candidates.filter((candidate) => {
+    if (filters.source && candidate.source !== filters.source) return false;
+    const text = resourceSearchText(candidate);
+    if (
+      filters.language === "zh" &&
+      !/中字|中文字幕|简体|繁体|简繁|国英|国语|国配|双语|特效字幕|\bch[st]\b/i.test(text)
+    ) {
+      return false;
+    }
+    if (filters.quality === "high" && !/\b(?:2160p|4k|uhd)\b|杜比视界/i.test(text)) {
+      return false;
+    }
+    if (filters.quality === "medium" && !/\b1080[pi]\b/i.test(text)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+export function sortManualResources(
+  resources: RankedManualResource[],
+  sort: ManualResourceSort,
+): RankedManualResource[] {
+  if (sort === "match") return resources;
+  return resources
+    .map((resource, ordinal) => ({ resource, ordinal }))
+    .sort((left, right) => {
+      const leftValue = sortableCandidateValue(left.resource.candidate, sort);
+      const rightValue = sortableCandidateValue(right.resource.candidate, sort);
+      if (leftValue === null && rightValue === null) return left.ordinal - right.ordinal;
+      if (leftValue === null) return 1;
+      if (rightValue === null) return -1;
+      const direction = sort === "size_asc" ? 1 : -1;
+      return (leftValue - rightValue) * direction || left.ordinal - right.ordinal;
+    })
+    .map(({ resource }) => resource);
+}
+
 /**
  * 对资源标题做可解释的确定性排序。分数只影响展示顺序，绝不会替用户自动选择。
  */
@@ -228,6 +301,30 @@ function scoreCandidate(
 
 function normalize(value: string): string {
   return value.normalize("NFKC").toLowerCase();
+}
+
+function resourceSearchText(candidate: ResourceCandidate): string {
+  return [
+    candidate.title,
+    stringPayload(candidate.providerPayload["originalTitle"]),
+    stringPayload(candidate.providerPayload["quality"]),
+  ].join(" ");
+}
+
+function sortableCandidateValue(
+  candidate: ResourceCandidate,
+  sort: ManualResourceSort,
+): number | null {
+  if (sort === "newest") {
+    const timestamp = Date.parse(stringPayload(candidate.providerPayload["datetime"]));
+    return Number.isNaN(timestamp) ? null : timestamp;
+  }
+  const size = candidate.providerPayload["sizeBytes"];
+  return typeof size === "number" && Number.isFinite(size) && size >= 0 ? size : null;
+}
+
+function stringPayload(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function compactText(value: string): string {

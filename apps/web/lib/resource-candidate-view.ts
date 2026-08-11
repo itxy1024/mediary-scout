@@ -16,3 +16,7 @@ export function candidateDateLabel(value: unknown): string | null {
   if (date.getUTCFullYear() <= 1) return null;
   return date.toLocaleDateString("zh-CN");
 }
+
+export function candidateTextLabel(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
