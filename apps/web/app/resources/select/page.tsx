@@ -8,6 +8,10 @@ import {
   getManualResourcePickerView,
   type ManualResourcePickerInput,
 } from "../../../lib/manual-resource-selection-server";
+import {
+  candidateDateLabel,
+  candidateSourceLabel,
+} from "../../../lib/resource-candidate-view";
 
 export default function ResourceSelectPage({
   searchParams,
@@ -94,9 +98,9 @@ async function ResourceSelectSurface({
                       <h2>{item.candidate.title}</h2>
                       <div className="resource-result-meta">
                         <span>{resourceTypeLabel(item.candidate.type)}</span>
-                        <span>{item.candidate.source || "未知来源"}</span>
-                        {candidateDate(item.candidate.providerPayload["datetime"]) ? (
-                          <span>{candidateDate(item.candidate.providerPayload["datetime"])}</span>
+                        <span>{candidateSourceLabel(item.candidate.source, item.candidate.type)}</span>
+                        {candidateDateLabel(item.candidate.providerPayload["datetime"]) ? (
+                          <span>{candidateDateLabel(item.candidate.providerPayload["datetime"])}</span>
                         ) : null}
                       </div>
                       <div className="resource-reasons">
@@ -177,11 +181,4 @@ function resourceTypeLabel(type: string): string {
   if (type === "tianyi") return "天翼分享";
   if (type === "123") return "123 分享";
   return type;
-}
-
-function candidateDate(value: unknown): string | null {
-  if (typeof value !== "string" || !value.trim()) return null;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value.slice(0, 10);
-  return date.toLocaleDateString("zh-CN");
 }

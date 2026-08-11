@@ -101,6 +101,53 @@ describe("PanSouResourceProvider", () => {
     ]);
   });
 
+  it("uses per-link titles, plugin sources, and non-zero result dates", async () => {
+    const provider = new PanSouResourceProvider({
+      baseURL: "https://pansou.example",
+      maxSearchAttempts: 1,
+      fetchJson: async () => ({
+        code: 0,
+        data: {
+          results: [
+            {
+              title: "甄嬛传",
+              unique_id: "thepiratebay-result-1",
+              datetime: "2026-08-11T08:00:00Z",
+              links: [
+                {
+                  type: "magnet",
+                  url: "magnet:?xt=urn:btih:first",
+                  datetime: "0001-01-01T00:00:00Z",
+                  work_title: "甄嬛传 S01 2160p",
+                },
+                {
+                  type: "magnet",
+                  url: "magnet:?xt=urn:btih:second",
+                  work_title: "甄嬛传 S01 1080p",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    });
+
+    const snapshot = await provider.search({ keyword: "甄嬛传" });
+
+    expect(snapshot.candidates.map((candidate) => candidate.title)).toEqual([
+      "甄嬛传 S01 2160p",
+      "甄嬛传 S01 1080p",
+    ]);
+    expect(snapshot.candidates.map((candidate) => candidate.source)).toEqual([
+      "plugin:thepiratebay",
+      "plugin:thepiratebay",
+    ]);
+    expect(snapshot.candidates.map((candidate) => candidate.providerPayload.datetime)).toEqual([
+      "2026-08-11T08:00:00Z",
+      "2026-08-11T08:00:00Z",
+    ]);
+  });
+
   it("recognizes quark links and filters candidates by allowedTypes (per-brand)", async () => {
     const fetchJson = async () => ({
       code: 0,

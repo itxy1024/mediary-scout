@@ -212,8 +212,9 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
     if (!isRecord(result)) {
       continue;
     }
-    const title = stringValue(result["title"]);
-    const source = stringValue(result["channel"]);
+    const resultTitle = stringValue(result["title"]);
+    const source = panSouResultSource(result);
+    const resultDatetime = usablePanSouDatetime(result["datetime"]);
     const links = Array.isArray(result["links"]) ? result["links"] : [];
     for (const link of links) {
       if (!isRecord(link)) {
@@ -227,13 +228,13 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
       }
       seenUrls.add(url);
       facts.push({
-        title,
+        title: stringValue(link["work_title"]).trim() || resultTitle,
         source,
         type,
         rawType,
         url,
         password: stringValue(link["password"]),
-        datetime: stringValue(link["datetime"]),
+        datetime: usablePanSouDatetime(link["datetime"]) || resultDatetime,
       });
     }
   }
@@ -297,6 +298,23 @@ function createSnapshotId(keyword: string, facts: PanSouLinkFact[], workflowRunI
 
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function panSouResultSource(result: Record<string, unknown>): string {
+  const channel = stringValue(result["channel"]).trim();
+  if (channel) return channel;
+
+  const uniqueId = stringValue(result["unique_id"]).trim();
+  const separator = uniqueId.indexOf("-");
+  return separator > 0 ? `plugin:${uniqueId.slice(0, separator)}` : "";
+}
+
+function usablePanSouDatetime(value: unknown): string {
+  const raw = stringValue(value).trim();
+  if (!raw) return "";
+
+  const date = new Date(raw);
+  return !Number.isNaN(date.getTime()) && date.getUTCFullYear() <= 1 ? "" : raw;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

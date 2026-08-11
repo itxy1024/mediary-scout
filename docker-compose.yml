@@ -35,6 +35,8 @@ services:
     ports:
       - "8890:80"
     env_file:
+      - path: deploy/pansou.channels.env
+        required: true
       - path: .env
         required: false
     logging: *default-logging
