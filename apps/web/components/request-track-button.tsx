@@ -1,6 +1,6 @@
 "use client";
 
-import { CalendarClock, Check, LoaderCircle, Plus } from "lucide-react";
+import { CalendarClock, Check, ListChecks, LoaderCircle, Plus } from "lucide-react";
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { requestTrackingAction, type RequestTrackingActionResult } from "../app/actions";
@@ -134,10 +134,6 @@ export function RequestTrackButton({
             setDemoPlaying(true);
             return;
           }
-          if (actionState !== "can_reserve" && tmdbId != null) {
-            router.push(resourcePickerHref({ kind: "movie", tmdbId, ...(storageId ? { storageId } : {}) }));
-            return;
-          }
           startTransition(async () => {
             const r = await runAction(
               () => requestTrackingAction({
@@ -164,6 +160,20 @@ export function RequestTrackButton({
         )}
         {isPending ? (actionState === "can_reserve" ? "预定中" : "请求中") : label}
       </button>
+      {actionState !== "can_reserve" && tmdbId != null ? (
+        <button
+          className="secondary-button manual-acquire-button"
+          type="button"
+          title="打开资源列表，手动选择要保存的候选"
+          disabled={isPending}
+          onClick={() => {
+            router.push(resourcePickerHref({ kind: "movie", tmdbId, ...(storageId ? { storageId } : {}) }));
+          }}
+        >
+          <ListChecks size={15} aria-hidden />
+          手动获取
+        </button>
+      ) : null}
       {/* A non-queued result (e.g. unsupported / failed) fell through to the
           requestable button — surface its reason instead of swallowing it. */}
       {result ? <p className="request-result">{result.message}</p> : null}
