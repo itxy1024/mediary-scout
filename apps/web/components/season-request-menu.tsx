@@ -148,7 +148,7 @@ export function SeasonRequestMenu({
   return (
     <div className="season-action-group">
       <div className="season-menu">
-        <button className="primary-button" type="button" disabled={isPending} onClick={autoSubmit}>
+        <button className="primary-button" type="button" disabled={isPending} onClick={() => autoSubmit()}>
           {isPending ? <LoaderCircle size={15} className="spin" aria-hidden /> : <Plus size={14} aria-hidden />}
           {isPending ? "请求中" : selected === "all" ? allLabel : `获取第 ${selected} 季`}
         </button>
