@@ -15,6 +15,7 @@ export function RequestSeasonButton({
   storageId,
   titleAcquiring = false,
   demoEntry,
+  replaceExisting = false,
 }: {
   tmdbId: number;
   seasonNumber: number;
@@ -25,6 +26,8 @@ export function RequestSeasonButton({
   titleAcquiring?: boolean;
   /** Demo only: recorded to the session library when the scripted playback ends. */
   demoEntry?: DemoAcquisitionEntry | undefined;
+  /** 手动选择整季新包时，覆盖当前季已有视频/字幕。 */
+  replaceExisting?: boolean;
 }) {
   const router = useRouter();
   const demo = isDemoModeClient();
@@ -60,13 +63,14 @@ export function RequestSeasonButton({
               kind: "season",
               tmdbId,
               seasonNumber,
+              ...(replaceExisting ? { replaceExisting: true } : {}),
               ...(storageId ? { storageId } : {}),
             }),
           );
         }}
       >
         <DownloadCloud size={13} aria-hidden />
-        获取本季
+        {replaceExisting ? "重新检索本季" : "获取本季"}
       </button>
   );
 }

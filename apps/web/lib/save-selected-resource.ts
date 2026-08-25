@@ -63,7 +63,9 @@ export async function saveSelectedResource(token: string): Promise<SaveSelectedR
 
     return {
       status: "queued",
-      message: "已锁定这条资源并加入后台队列。若保存失败，系统不会自动改选其他资源。",
+      message: selection.target.replaceExisting
+        ? "已锁定这条资源并加入覆盖队列。旧视频/字幕会在任务开始时清理。"
+        : "已锁定这条资源并加入后台队列。若保存失败，系统不会自动改选其他资源。",
       ...(result.workflowRunId ? { workflowRunId: result.workflowRunId } : {}),
     };
   } catch (error) {

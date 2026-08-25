@@ -56,6 +56,8 @@ export interface RunAcquisitionV2WorkflowRequest {
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
   assrtToken?: string;
+  /** 覆盖整季时清理目标季的视频/字幕，并从空的已获取状态开始。 */
+  replaceExisting?: boolean;
   deadLinkStore?: DeadLinkStore;
   onProgress?: (event: AgentToolEvent) => void;
 }
@@ -104,7 +106,11 @@ export async function runAcquisitionV2Workflow(
     seasonNumber: season.seasonNumber,
     latestAiredEpisode: season.latestAiredEpisode,
   }));
-  const priorObtained = request.priorObtained ?? [];
+  const priorObtained = request.replaceExisting ? [] : request.priorObtained ?? [];
+
+  if (request.replaceExisting) {
+    await clearExistingSeasonMedia(request.executor, Object.values(directories.seasonDirectoryIds));
+  }
 
   // 7b — sync the need from the DB marks (应有 − 实有). No 115 scan, no parser.
   const before = syncSeasonNeed({ seasons: seasonsForSync, obtained: priorObtained });
@@ -180,4 +186,22 @@ export async function runAcquisitionV2Workflow(
   };
     },
   );
+}
+
+const REPLACEABLE_MEDIA = /\.(?:mkv|mp4|avi|ts|m2ts|mov|flv|wmv|srt|ass|ssa|sub|idx|vtt|sup|smi)$/i;
+
+/** 覆盖模式只删除视频和字幕，保留 Season 目录及 NFO/海报等元数据。 */
+async function clearExistingSeasonMedia(
+  executor: Pick<StorageExecutor, "listTree" | "deleteFiles">,
+  directoryIds: string[],
+): Promise<void> {
+  for (const directoryId of directoryIds) {
+    const files = await executor.listTree({ directoryId });
+    const fileIds = files
+      .filter((file) => REPLACEABLE_MEDIA.test(file.path))
+      .map((file) => file.providerFileId);
+    if (fileIds.length > 0) {
+      await executor.deleteFiles({ directoryId, fileIds });
+    }
+  }
 }

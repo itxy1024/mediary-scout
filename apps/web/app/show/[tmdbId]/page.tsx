@@ -503,6 +503,17 @@ function SeasonRow({
             </div>
           ))}
         </div>
+        <div className="season-replace-row">
+          <RequestSeasonButton
+            tmdbId={tmdbId}
+            seasonNumber={season.seasonNumber}
+            storageId={storageId}
+            titleAcquiring={acquiring}
+            replaceExisting
+            demoEntry={demoEntry}
+          />
+          <span>重新检索整季资源，选中后覆盖当前季文件</span>
+        </div>
         <div className="season-untrack-row">
           <UntrackButton
             tmdbId={tmdbId}

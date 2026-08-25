@@ -340,6 +340,9 @@ export async function runQueuedType2Workflow(input: {
       priorObtained: claimed.episodes
         .filter((episode) => episode.obtained)
         .map((episode) => episode.episodeCode),
+      replaceExisting: claimed.workflowRun.auditEvents.some(
+        (event) => event.type === "manual_resource_selected" && event.data?.["replaceExisting"] === true,
+      ),
       storage: deps.storage,
       model: deps.model,
       repository: input.repository,

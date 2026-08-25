@@ -50,6 +50,8 @@ interface TvV2Common {
   assrtToken?: string;
   /** 手动重新选资源时保留此前已经确认入库的集数。 */
   priorObtained?: string[];
+  /** 手动从详情页重新检索整季时，清理旧视频/字幕后以新包为准。 */
+  replaceExisting?: boolean;
   /**
    * Wall clock for the run. Drives the engine's timestamps (including the
    * terminal notification's `createdAt`) AND the persisted `finishedAt`, which
@@ -169,6 +171,7 @@ export async function runType2InitializationV2AndPersist(
       storage: input.storage,
     }),
     ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
+    ...(input.replaceExisting ? { replaceExisting: true } : {}),
     ...passthrough(input),
   });
 

@@ -70,6 +70,9 @@ async function ResourceSelectSurface({
                 <p>
                   {view.title.title} · {view.scopeLabel} · 共 {view.items.length} / {view.totalCandidateCount} 条候选
                 </p>
+                {view.target.replaceExisting ? (
+                  <p className="resource-picker-overwrite-note">覆盖模式：选择后将替换当前季已有的视频和字幕。</p>
+                ) : null}
               </div>
             </div>
 
@@ -123,6 +126,7 @@ async function ResourceSelectSurface({
                     <SaveSelectedResourceForm
                       token={item.token}
                       {...(storageId ? { storageId } : {})}
+                      replaceExisting={view.target.replaceExisting === true}
                     />
                   </article>
                 ))}
@@ -175,6 +179,7 @@ function parsePickerInput(
   const parsedLanguageFilter = languageFilter(params.language);
   const parsedQualityFilter = qualityFilter(params.quality);
   const parsedSort = sortValue(params.sort);
+  const replaceExisting = stringParam(params.replace) === "1";
   return {
     kind,
     tmdbId,
@@ -184,6 +189,7 @@ function parsePickerInput(
     ...(parsedLanguageFilter ? { languageFilter: parsedLanguageFilter } : {}),
     ...(parsedQualityFilter ? { qualityFilter: parsedQualityFilter } : {}),
     ...(parsedSort ? { sort: parsedSort } : {}),
+    ...(replaceExisting ? { replaceExisting: true } : {}),
   };
 }
 

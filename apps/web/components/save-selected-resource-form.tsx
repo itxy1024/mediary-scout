@@ -5,7 +5,15 @@ import { type FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { SaveSelectedResourceResult } from "../lib/save-selected-resource";
 
-export function SaveSelectedResourceForm({ token, storageId }: { token: string; storageId?: string }) {
+export function SaveSelectedResourceForm({
+  token,
+  storageId,
+  replaceExisting = false,
+}: {
+  token: string;
+  storageId?: string;
+  replaceExisting?: boolean;
+}) {
   const router = useRouter();
   const [state, setState] = useState<SaveSelectedResourceResult | null>(null);
   const [pending, setPending] = useState(false);
@@ -13,6 +21,9 @@ export function SaveSelectedResourceForm({ token, storageId }: { token: string; 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (pending) return;
+    if (replaceExisting && !window.confirm("确认用这条整季资源覆盖当前季已有的视频和字幕吗？旧文件将被删除。")) {
+      return;
+    }
     setPending(true);
     setState(null);
     try {
@@ -48,7 +59,13 @@ export function SaveSelectedResourceForm({ token, storageId }: { token: string; 
         ) : (
           <Check size={15} aria-hidden />
         )}
-        {pending ? "正在提交" : state?.status === "queued" ? "已加入队列" : "保存此资源"}
+        {pending
+          ? "正在提交"
+          : state?.status === "queued"
+            ? "已加入队列"
+            : replaceExisting
+              ? "覆盖并保存"
+              : "保存此资源"}
       </button>
       {state?.status === "error" ? <p className="request-result">{state.message}</p> : null}
     </form>

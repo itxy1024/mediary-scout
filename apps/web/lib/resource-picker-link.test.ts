@@ -8,6 +8,12 @@ describe("resourcePickerHref", () => {
     );
   });
 
+  it("覆盖模式会保留在资源选择地址中", () => {
+    expect(
+      resourcePickerHref({ kind: "season", tmdbId: 42, seasonNumber: 1, replaceExisting: true }),
+    ).toBe("/resources/select?kind=season&tmdbId=42&season=1&replace=1");
+  });
+
   it("从手选快照恢复失败后的重新选择地址", () => {
     expect(
       manualSelectionResourcePickerHref(

@@ -11,6 +11,8 @@ export interface ManualResourceTarget {
   kind: ManualResourceTargetKind;
   tmdbId: number;
   seasonNumber?: number;
+  /** 从详情页重新检索整季时，用新资源包替换该季已有视频/字幕。 */
+  replaceExisting?: boolean;
 }
 
 export interface ManualResourceSelection {
@@ -155,6 +157,7 @@ export function createManualSelectionEvidence(input: {
         kind: input.selection.target.kind,
         tmdbId: input.selection.target.tmdbId,
         seasonNumber: input.selection.target.seasonNumber ?? null,
+        replaceExisting: input.selection.target.replaceExisting === true,
         candidateId,
         candidateTitle: candidate.title,
       },

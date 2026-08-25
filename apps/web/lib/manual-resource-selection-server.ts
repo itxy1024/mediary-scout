@@ -70,6 +70,7 @@ const targetSchema = z.object({
   kind: z.enum(["movie", "season", "remaining", "series"]),
   tmdbId: z.number().int().positive(),
   seasonNumber: z.number().int().positive().optional(),
+  replaceExisting: z.boolean().optional(),
 });
 
 const candidateSchema = z.object({
@@ -233,6 +234,7 @@ export async function verifyManualResourceSelectionToken(token: string): Promise
         ...(payload.target.seasonNumber !== undefined
           ? { seasonNumber: payload.target.seasonNumber }
           : {}),
+        ...(payload.target.replaceExisting === true ? { replaceExisting: true } : {}),
       },
       candidate: payload.candidate as ResourceCandidate,
     },
@@ -273,7 +275,12 @@ async function resolvePickerTarget(input: ManualResourcePickerInput): Promise<{
     );
     if (!season) throw new Error("无法读取该季的信息。");
     return {
-      target: { kind: "season", tmdbId: input.tmdbId, seasonNumber: input.seasonNumber },
+      target: {
+        kind: "season",
+        tmdbId: input.tmdbId,
+        seasonNumber: input.seasonNumber,
+        ...(input.replaceExisting ? { replaceExisting: true } : {}),
+      },
       title: season.title,
       seasonNumbers: [input.seasonNumber],
       scopeLabel: `第 ${input.seasonNumber} 季`,

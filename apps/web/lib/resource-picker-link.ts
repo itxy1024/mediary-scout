@@ -5,6 +5,7 @@ export function resourcePickerHref(input: {
   tmdbId: number;
   seasonNumber?: number;
   storageId?: string;
+  replaceExisting?: boolean;
 }): string {
   const params = new URLSearchParams({
     kind: input.kind,
@@ -12,6 +13,7 @@ export function resourcePickerHref(input: {
   });
   if (input.seasonNumber !== undefined) params.set("season", String(input.seasonNumber));
   if (input.storageId) params.set("w", input.storageId);
+  if (input.replaceExisting) params.set("replace", "1");
   return `/resources/select?${params.toString()}`;
 }
 
@@ -40,6 +42,7 @@ export function manualSelectionResourcePickerHref(
     kind,
     tmdbId,
     ...(typeof seasonNumber === "number" ? { seasonNumber } : {}),
+    ...(target["replaceExisting"] === true ? { replaceExisting: true } : {}),
     ...(storageId ? { storageId } : {}),
   });
 }
