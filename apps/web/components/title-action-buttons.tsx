@@ -1,8 +1,10 @@
 "use client";
 
-import { Check, DownloadCloud, Layers } from "lucide-react";
-import { useState } from "react";
+import { Check, DownloadCloud, Layers, ListChecks, LoaderCircle } from "lucide-react";
+import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
+import { requestRemainingAction, requestSeasonAction } from "../app/actions";
+import { runAction } from "../lib/run-action";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { DemoAcquirePlayback } from "./demo-acquire-playback";
 import type { DemoAcquisitionEntry } from "../lib/demo-session";
@@ -30,6 +32,8 @@ export function RequestSeasonButton({
   replaceExisting?: boolean;
 }) {
   const router = useRouter();
+  const [isPending, startTransition] = useTransition();
+  const [resultMessage, setResultMessage] = useState<string | null>(null);
   const demo = isDemoModeClient();
   const [demoPlaying, setDemoPlaying] = useState(false);
   const acquiredIds = useDemoAcquiredTmdbIds();
@@ -48,8 +52,9 @@ export function RequestSeasonButton({
   }
 
   return (
+    <div className="season-action-group">
       <button
-        className="season-request-button"
+        className="primary-button"
         type="button"
         title={titleAcquiring ? "该剧正在获取中，请稍候" : `检索第 ${seasonNumber} 季资源`}
         disabled={titleAcquiring}
@@ -58,6 +63,26 @@ export function RequestSeasonButton({
             setDemoPlaying(true);
             return;
           }
+          startTransition(async () => {
+            const result = await runAction(
+              () => requestSeasonAction({ tmdbId, seasonNumber, storageId }),
+              (message) => setResultMessage(message),
+            );
+            if (result.ok) {
+              setResultMessage(result.value.message);
+              router.refresh();
+            }
+          });
+        }}
+      >
+        {isPending ? <LoaderCircle size={15} className="spin" aria-hidden /> : <DownloadCloud size={13} aria-hidden />}
+        {isPending ? "请求中" : "获取本季"}
+      </button>
+      <button
+        className="primary-button manual-acquire-button"
+        type="button"
+        disabled={isPending}
+        onClick={() =>
           router.push(
             resourcePickerHref({
               kind: "season",
@@ -66,12 +91,14 @@ export function RequestSeasonButton({
               ...(replaceExisting ? { replaceExisting: true } : {}),
               ...(storageId ? { storageId } : {}),
             }),
-          );
-        }}
+          )
+        }
       >
-        <DownloadCloud size={13} aria-hidden />
-        {replaceExisting ? "重新检索本季" : "获取本季"}
+        <ListChecks size={15} aria-hidden />
+        {replaceExisting ? "重新检索本季" : "手动获取"}
       </button>
+      {resultMessage ? <p className="request-result">{resultMessage}</p> : null}
+    </div>
   );
 }
 
@@ -93,6 +120,8 @@ export function RequestRemainingButton({
   demoEntry?: DemoAcquisitionEntry | undefined;
 }) {
   const router = useRouter();
+  const [isPending, startTransition] = useTransition();
+  const [resultMessage, setResultMessage] = useState<string | null>(null);
   const demo = isDemoModeClient();
   const [demoPlaying, setDemoPlaying] = useState(false);
   const acquiredIds = useDemoAcquiredTmdbIds();
@@ -111,6 +140,7 @@ export function RequestRemainingButton({
   }
 
   return (
+    <div className="season-action-group">
       <button
         className="primary-button"
         type="button"
@@ -121,13 +151,33 @@ export function RequestRemainingButton({
             setDemoPlaying(true);
             return;
           }
-          router.push(
-            resourcePickerHref({ kind: "remaining", tmdbId, ...(storageId ? { storageId } : {}) }),
-          );
+          startTransition(async () => {
+            const result = await runAction(
+              () => requestRemainingAction({ tmdbId, storageId }),
+              (message) => setResultMessage(message),
+            );
+            if (result.ok) {
+              setResultMessage(result.value.message);
+              router.refresh();
+            }
+          });
         }}
       >
-        <Layers size={14} aria-hidden />
-        {label}
+        {isPending ? <LoaderCircle size={15} className="spin" aria-hidden /> : <Layers size={14} aria-hidden />}
+        {isPending ? "请求中" : label}
       </button>
+      <button
+        className="primary-button manual-acquire-button"
+        type="button"
+        disabled={isPending}
+        onClick={() =>
+          router.push(resourcePickerHref({ kind: "remaining", tmdbId, ...(storageId ? { storageId } : {}) }))
+        }
+      >
+        <ListChecks size={15} aria-hidden />
+        手动获取
+      </button>
+      {resultMessage ? <p className="request-result">{resultMessage}</p> : null}
+    </div>
   );
 }

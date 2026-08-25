@@ -2786,8 +2786,17 @@ select.setting-control {
   white-space: nowrap;
 }
 
+.request-track > .primary-button,
+.season-action-group > .primary-button,
+.season-menu .primary-button {
+  min-width: 128px;
+  justify-content: center;
+}
+
 .manual-acquire-button {
   white-space: nowrap;
+  min-width: 128px;
+  justify-content: center;
 }
 
 .back-link {
@@ -3860,6 +3869,18 @@ select.setting-control {
   margin-top: 12px;
   display: flex;
   justify-content: flex-end;
+}
+
+.season-action-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  position: relative;
+  flex-wrap: wrap;
+}
+
+.season-action-group > .request-result {
+  flex-basis: 100%;
 }
 
 .season-replace-row {

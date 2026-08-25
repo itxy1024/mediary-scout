@@ -162,7 +162,7 @@ export function RequestTrackButton({
       </button>
       {actionState !== "can_reserve" && tmdbId != null ? (
         <button
-          className="secondary-button manual-acquire-button"
+          className="primary-button manual-acquire-button"
           type="button"
           title="打开资源列表，手动选择要保存的候选"
           disabled={isPending}
