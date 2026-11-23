@@ -1,9 +1,76 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { PanSouResourceProvider } from "../src/index.js";
+import { PanSouResourceProvider, normalizeResourceType } from "../src/index.js";
 
 describe("PanSouResourceProvider", () => {
+  it("never has more than two searches in flight against one server, even across providers", async () => {
+    // Parallel patrol runs each build their own provider over the same PanSou,
+    // which answers 502 from about four simultaneous searches.
+    let inFlight = 0;
+    let peak = 0;
+    const fetchJson = async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return { code: 0, data: { total: 0 } };
+    };
+    const make = (baseURL: string) => new PanSouResourceProvider({ baseURL, maxSearchAttempts: 1, fetchJson });
+    const a = make("https://slots.example");
+    const b = make("https://slots.example/");
+    await Promise.all(["k1", "k2", "k3", "k4", "k5"].map((kw, i) => (i % 2 ? a : b).search({ keyword: kw })));
+    expect(peak).toBe(2);
+
+    // A different server has its own slots.
+    peak = 0;
+    const c = make("https://other-a.example");
+    const d = make("https://other-b.example");
+    await Promise.all([c.search({ keyword: "x" }), c.search({ keyword: "y" }), d.search({ keyword: "z" }), d.search({ keyword: "w" })]);
+    expect(peak).toBe(4);
+  });
+
+  it("holds the slot across a search's polls, not just each request", async () => {
+    // Each search polls 3 times with waits in between. From each keyword's first
+    // request start to its last request end, at most two keywords overlap.
+    const spans = new Map<string, { start: number; end: number }>();
+    let clock = 0;
+    const provider = new PanSouResourceProvider({
+      baseURL: "https://polls.example",
+      maxSearchAttempts: 3,
+      searchPollMs: 2,
+      fetchJson: async (_url, init) => {
+        const kw = JSON.parse(String(init?.body)).kw as string;
+        const span = spans.get(kw) ?? { start: (clock += 1), end: 0 };
+        spans.set(kw, span);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        span.end = clock += 1;
+        // A new link on every poll keeps the provider polling all 3 attempts.
+        const links = Array.from({ length: clock }, (_, i) => ({ type: "magnet", url: `magnet:?xt=urn:btih:${kw}${i}` }));
+        return { code: 0, data: { results: [{ title: kw, links }] } };
+      },
+    });
+    await Promise.all(["a", "b", "c", "d"].map((kw) => provider.search({ keyword: kw })));
+    const all = [...spans.values()];
+    const peak = Math.max(...all.map((s) => all.filter((o) => o.start <= s.start && s.start < o.end).length));
+    expect(peak).toBe(2);
+  });
+
+  it("frees the slot when a search throws", async () => {
+    let calls = 0;
+    const provider = new PanSouResourceProvider({
+      baseURL: "https://throws.example",
+      maxSearchAttempts: 1,
+      fetchJson: async () => {
+        calls += 1;
+        throw new Error("boom");
+      },
+    });
+    const results = await Promise.all([1, 2, 3, 4].map((n) => provider.search({ keyword: `k${n}` })));
+    expect(calls).toBe(4);
+    expect(results.every((r) => r.sourceHealth?.status === "unreachable" || r.candidates.length === 0)).toBe(true);
+  });
+
   it("maps PanSou 115 and magnet links into a resource snapshot", async () => {
     const provider = new PanSouResourceProvider({
       baseURL: "https://pansou.example",
@@ -101,51 +168,73 @@ describe("PanSouResourceProvider", () => {
     ]);
   });
 
-  it("uses per-link titles, plugin sources, and non-zero result dates", async () => {
+  it("recognizes UC share links as type 'uc' and keeps them out of a 夸克 drive", async () => {
+    // PanSou's real shape: data.results[] = {title, channel, links[{type,url,...}]}.
+    const payload = {
+      code: 0,
+      data: {
+        total: 3,
+        results: [
+          {
+            title: "UC 资源",
+            channel: "tg",
+            links: [
+              { type: "uc", url: "https://drive.uc.cn/s/ad26437c945f4", password: "" },
+              // rawType "uc" only NOMINATES; a lookalike host still fails the
+              // parser and is dropped rather than becoming an untransferable
+              // candidate the agent would burn a turn on.
+              { type: "uc", url: "https://evil-uc.cn.attacker.com/s/x", password: "" },
+            ],
+          },
+          { title: "夸克 资源", channel: "tg", links: [{ type: "quark", url: "https://pan.quark.cn/s/abc", password: "p" }] },
+        ],
+      },
+    };
+
+    const all = await new PanSouResourceProvider({
+      baseURL: "http://pansou.test",
+      maxSearchAttempts: 1,
+      fetchJson: async () => payload,
+    }).search({
+      keyword: "k",
+    });
+    // The real UC link + the quark link survive; the lookalike does not.
+    expect(all.candidates.map((c) => c.type).sort()).toEqual(["quark", "uc"]);
+
+    const ucOnly = await new PanSouResourceProvider({
+      baseURL: "http://pansou.test",
+      maxSearchAttempts: 1,
+      fetchJson: async () => payload,
+      allowedTypes: ["uc"],
+    }).search({ keyword: "k" });
+    expect(ucOnly.candidates).toHaveLength(1);
+    expect(ucOnly.candidates[0]?.type).toBe("uc");
+    expect(ucOnly.candidates[0]?.providerPayload.url).toBe("https://drive.uc.cn/s/ad26437c945f4");
+  });
+
+  it("classifies a UC URL by SHAPE even when PanSou mislabels rawType", async () => {
     const provider = new PanSouResourceProvider({
-      baseURL: "https://pansou.example",
+      baseURL: "http://pansou.test",
       maxSearchAttempts: 1,
       fetchJson: async () => ({
         code: 0,
         data: {
+          total: 2,
           results: [
             {
-              title: "甄嬛传",
-              unique_id: "thepiratebay-result-1",
-              datetime: "2026-08-11T08:00:00Z",
+              title: "mislabelled",
+              channel: "tg",
               links: [
-                {
-                  type: "magnet",
-                  url: "magnet:?xt=urn:btih:first",
-                  datetime: "0001-01-01T00:00:00Z",
-                  work_title: "甄嬛传 S01 2160p",
-                },
-                {
-                  type: "magnet",
-                  url: "magnet:?xt=urn:btih:second",
-                  work_title: "甄嬛传 S01 1080p",
-                },
+                { type: "other", url: "https://drive.uc.cn/s/shapeonly123", password: "" },
+                { type: "other", url: "https://evil-uc.cn.attacker.com/s/x", password: "" },
               ],
             },
           ],
         },
       }),
     });
-
-    const snapshot = await provider.search({ keyword: "甄嬛传" });
-
-    expect(snapshot.candidates.map((candidate) => candidate.title)).toEqual([
-      "甄嬛传 S01 2160p",
-      "甄嬛传 S01 1080p",
-    ]);
-    expect(snapshot.candidates.map((candidate) => candidate.source)).toEqual([
-      "plugin:thepiratebay",
-      "plugin:thepiratebay",
-    ]);
-    expect(snapshot.candidates.map((candidate) => candidate.providerPayload.datetime)).toEqual([
-      "2026-08-11T08:00:00Z",
-      "2026-08-11T08:00:00Z",
-    ]);
+    const result = await provider.search({ keyword: "k" });
+    expect(result.candidates.map((c) => c.type)).toEqual(["uc"]); // lookalike dropped
   });
 
   it("recognizes quark links and filters candidates by allowedTypes (per-brand)", async () => {
@@ -261,6 +350,41 @@ describe("PanSouResourceProvider", () => {
     expect(snapshot.candidates.map((c) => c.providerPayload.url)).toEqual([
       "https://www.123pan.com/s/AbCd-12",
       "https://www.123684.com/s/abc-1?pwd=x",
+    ]);
+  });
+
+  it("recognizes 光鸭 share links by rawType and by guangyapan.com/s/ shape, and keeps the password", async () => {
+    const fetchJson = async () => ({
+      code: 0,
+      data: {
+        results: [
+          {
+            title: "出入平安 (2024)",
+            channel: "c",
+            links: [
+              { type: "guangya", url: "https://www.guangyapan.com/s/1947864096514232347_amtV6IXLP9l33m6z", password: "" },
+              { type: "others", url: "https://www.guangyapan.com/s/1946057909719502939_amDq", password: "ab12" },
+              // The site root is not a share.
+              { type: "others", url: "https://www.guangyapan.com/" },
+              // A lookalike host is not 光鸭 even if PanSou calls it guangya (Copilot #271 r3).
+              { type: "guangya", url: "https://evilguangyapan.com/s/1947864096514232347_x" },
+              { type: "quark", url: "https://pan.quark.cn/s/abc" },
+            ],
+          },
+        ],
+      },
+    });
+    const guangyaOnly = new PanSouResourceProvider({
+      baseURL: "https://pansou.example",
+      maxSearchAttempts: 1,
+      allowedTypes: ["guangya"],
+      fetchJson,
+    });
+    const snapshot = await guangyaOnly.search({ keyword: "k" });
+    expect(snapshot.candidates.map((c) => c.type)).toEqual(["guangya", "guangya"]);
+    expect(snapshot.candidates.map((c) => c.providerPayload.url)).toEqual([
+      "https://www.guangyapan.com/s/1947864096514232347_amtV6IXLP9l33m6z",
+      "https://www.guangyapan.com/s/1946057909719502939_amDq",
     ]);
   });
 
@@ -455,4 +579,57 @@ describe("PanSouResourceProvider request timeout", () => {
     // error path; well under a second proves the wait is bounded.
     expect(elapsedMs).toBeLessThan(2000);
   }, 10_000);
+});
+
+// The candidate classifier is shared with the haisou provider, so a gap here is a
+// gap on both paths. Each brand must be validated by its OWN executor parser:
+// trusting the declared platform alone lets an arbitrary URL become a candidate
+// that then fails (or worse, gets trusted) at transfer time.
+describe("normalizeResourceType — URL shape beats the declared platform", () => {
+  it.each([
+    ["115", "https://115.com/s/abc123"],
+    ["115", "https://115cdn.com/s/abc123"],
+    ["quark", "https://pan.quark.cn/s/abc123"],
+    ["uc", "https://drive.uc.cn/s/abc123"],
+    ["123", "https://www.123pan.cn/s/abcd"],
+    ["tianyi", "https://cloud.189.cn/t/aARrYvVBbiMb"],
+    ["guangya", "https://www.guangyapan.com/s/1961038051308896266_al17ELaa58LSIYXK"],
+  ])("accepts a real %s share URL", (rawType, url) => {
+    expect(normalizeResourceType(rawType, url)).toBe(rawType);
+  });
+
+  it.each([
+    ["115", "https://evil.example.com/whatever"],
+    ["quark", "https://evil.example.com/pan.quark.cn/s/abc"],
+    ["quark", "https://evilpan.quark.cn/s/abc"],
+    ["uc", "https://attacker.com/drive.uc.cn/s/x"],
+    ["123", "https://evil.example.com/x"],
+    ["tianyi", "https://evil.example.com/x"],
+    ["guangya", "https://evil.example.com/s/x"],
+  ])("rejects a %s candidate whose URL is not a real share link (%s)", (rawType, url) => {
+    expect(normalizeResourceType(rawType, url)).toBeNull();
+  });
+
+  // Regression pin: a magnet tagged with a drive brand must stay a magnet. It used
+  // to fall into the brand branch, which (once those branches started demanding a
+  // real share URL) dropped it outright — quietly losing every 115-sourced torrent.
+  // A mislabelled rawType must not be able to drop a link whose URL is a valid
+  // share for some other brand: the shape is what the executor will act on.
+  it.each([
+    ["115", "https://pan.quark.cn/s/abc123", "quark"],
+    ["123", "https://pan.quark.cn/s/abc123", "quark"],
+    ["quark", "https://115.com/s/abc123", "115"],
+    ["115", "https://drive.uc.cn/s/abc123", "uc"],
+    ["tianyi", "https://www.123pan.com/s/abcd-efg", "123"],
+    ["quark", "https://cloud.189.cn/t/aARrYvVBbiMb", "tianyi"],
+  ])("classifies by URL shape even when rawType is mislabelled %s → %s", (rawType, url, want) => {
+    expect(normalizeResourceType(rawType, url)).toBe(want);
+  });
+
+  it.each(["115", "123", "tianyi", "quark", "uc", "guangya", "magnet"])(
+    "classifies a magnet as magnet even when rawType is %s",
+    (rawType) => {
+      expect(normalizeResourceType(rawType, "magnet:?xt=urn:btih:abc")).toBe("magnet");
+    },
+  );
 });

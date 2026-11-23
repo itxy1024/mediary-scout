@@ -37,6 +37,14 @@ export interface TransferAttemptResult {
   noTargetChange?: true;
 }
 
+/** One file's outcome inside a subtitle package landing (StorageV2.transferSubtitleUrls). */
+export interface SubtitleLandingResult extends TransferAttemptResult {
+  filename: string;
+  /** The name the file actually landed under, when the executor knows it differs or
+   *  may differ from `filename` (123: `name(1).ext` next to an existing `name.ext`). */
+  landedFilename?: string;
+}
+
 /** What a candidate transfer would land — files keyed by their path relative to
  *  the staging dir (paths with "/" model the pack's own wrapper directory). */
 export interface PackSpec {
@@ -63,17 +71,21 @@ const SUBTITLE_EXTENSIONS = /\.(srt|ass|ssa|sub|idx|vtt|sup|smi)$/i;
  *  executor both satisfy it. */
 export interface StorageV2 {
   createDirectory(input: { name: string; parentId: string }): Promise<string>;
-  transferCandidate(input: { candidateId: string; intoDirectoryId: string }): Promise<TransferAttemptResult>;
-  /** A candidate's link kind. Every 转存分享 brand (115/夸克/天翼/123) fails LOUD
+  transferCandidate(input: {
+    candidateId: string;
+    intoDirectoryId: string;
+    storageId?: string;
+  }): Promise<TransferAttemptResult>;
+  /** A candidate's link kind. Every 转存分享 brand (115/夸克/天翼/123/光鸭) fails LOUD
    *  on a dead link (链接已过期/分享已取消/分享不存在 come back immediately); a
    *  magnet's success is only knowable by the landing point appearing. So
    *  `transferUntilLanded` (which iterates on failure) accepts only "share"
    *  candidates and uses this to reject magnets/unknown links up front. */
   candidateLinkKind(candidateId: string): "share" | "magnet" | "unknown";
-  listTree(input: { directoryId: string }): Promise<SimTreeFile[]>;
+  listTree(input: { directoryId: string; maxDepth?: number }): Promise<SimTreeFile[]>;
   /** Recursive list of subdirectories under a directory (path relative to it) —
    *  the source of the wrapper-dir handle flatten removes. */
-  listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>>;
+  listSubdirectories(input: { directoryId: string; maxDepth?: number }): Promise<Array<{ id: string; path: string }>>;
   moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }>;
   /** Rename a single file in place (same directory) — the subtitle-rename exception. */
   renameFile(input: { directoryId: string; fileId: string; newName: string }): Promise<void>;
@@ -82,15 +94,19 @@ export interface StorageV2 {
   deleteFiles(input: { directoryId: string; fileIds: string[] }): Promise<{ deleted: string[] }>;
   /** Remove a directory and everything nested under it (the flatten peel-off). */
   removeDirectory(input: { directoryId: string }): Promise<{ removed: string[] }>;
-  /** Subtitle direct-link landing (test-double): drops a same-named file into the
-   *  target dir so sandbox/agent-loop tests work without a real 115 round-trip.
-   *  No workflowRunId here: run identity is the ADAPTER's business (RealStorageV2
-   *  scopes attempts to its own run) — callers must not pretend to control it. */
-  transferSubtitleUrl(input: {
-    url: string;
-    filename: string;
+  /** Subtitle direct-link landing for a WHOLE package: each file's url and the
+   *  bare filename it should land under. One result per input file, in input
+   *  order. Batch is the production path — a per-file loop pays the landing poll
+   *  once per file (the 2026-09-20 LIAR GAME run spent 260 of its 300 115 calls
+   *  on one 22-file package); a batch polls the directory once per round for all
+   *  of them. No workflowRunId here: run identity is the ADAPTER's business
+   *  (RealStorageV2 scopes attempts to its own run) — callers must not pretend to
+   *  control it. This is the ONLY subtitle-landing entry point on the surface: a
+   *  per-file one would invite exactly the loop that burned the budget. */
+  transferSubtitleUrls(input: {
+    files: Array<{ url: string; filename: string }>;
     intoDirectoryId: string;
-  }): Promise<TransferAttemptResult>;
+  }): Promise<SubtitleLandingResult[]>;
 }
 
 export class Storage115Simulator implements StorageV2 {
@@ -187,6 +203,9 @@ export class Storage115Simulator implements StorageV2 {
     return { status: "succeeded", materializedFileIds };
   }
 
+  /** Single-file landing — the per-file SEAM (kept public so tests can seed staging
+   *  and script individual outcomes by overriding it); transferSubtitleUrls below
+   *  dispatches through it, so those overrides apply to the batch too. */
   async transferSubtitleUrl(input: {
     url: string;
     filename: string;
@@ -206,14 +225,47 @@ export class Storage115Simulator implements StorageV2 {
     return { status: "succeeded", materializedFileIds: [id] };
   }
 
-  /** Recursive, path-preserving snapshot of everything under a directory. */
-  async listTree(input: { directoryId: string }): Promise<SimTreeFile[]> {
+  /** Batch landing — the StorageV2 surface. Cost model: 1 for the package's shared
+   *  overhead (write-scope check + before snapshot on the real 115) + 1 per file —
+   *  the same "one call per file it touches" 口径 as transferCandidate's
+   *  1 + files.length. Note the sim can THROW mid-package when the budget runs out:
+   *  that is deliberate 逆鳞 fail-loud behavior for tests, NOT what the real 115
+   *  executor does (it degrades to SUBTITLE_NOT_SUBMITTED / no_target_change per
+   *  file and returns) — don't "fix" one to match the other. */
+  async transferSubtitleUrls(input: {
+    files: Array<{ url: string; filename: string }>;
+    intoDirectoryId: string;
+  }): Promise<SubtitleLandingResult[]> {
+    if (!this.dirs.has(input.intoDirectoryId)) {
+      throw new Error(`SIM_DIR_NOT_FOUND: target ${input.intoDirectoryId}`);
+    }
+    this.spendBudget(1);
+    const results: SubtitleLandingResult[] = [];
+    for (const file of input.files) {
+      const result = await this.transferSubtitleUrl({
+        url: file.url,
+        filename: file.filename,
+        intoDirectoryId: input.intoDirectoryId,
+      });
+      // Input filename is authoritative: spread the result FIRST so no future field
+      // on TransferAttemptResult can ever override the name the caller asked for.
+      results.push({ ...result, filename: file.filename });
+    }
+    return results;
+  }
+
+  /** Recursive, path-preserving snapshot of everything under a directory.
+   *  Same walk as the real executors: the root is depth 1, and a directory
+   *  deeper than maxDepth is not opened. Default 6. */
+  async listTree(input: { directoryId: string; maxDepth?: number }): Promise<SimTreeFile[]> {
     if (!this.dirs.has(input.directoryId)) {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
     }
     this.spendBudget(1);
+    const maxDepth = input.maxDepth ?? 6;
     const out: SimTreeFile[] = [];
-    const walk = (dirId: string, prefix: string): void => {
+    const walk = (dirId: string, prefix: string, depth: number): void => {
+      if (depth > maxDepth) return;
       for (const file of this.files.values()) {
         if (file.parentId === dirId) {
           out.push({
@@ -227,11 +279,11 @@ export class Storage115Simulator implements StorageV2 {
       }
       for (const dir of this.dirs.values()) {
         if (dir.parentId === dirId) {
-          walk(dir.id, `${prefix}${dir.name}/`);
+          walk(dir.id, `${prefix}${dir.name}/`, depth + 1);
         }
       }
     };
-    walk(input.directoryId, "");
+    walk(input.directoryId, "", 1);
     return out.sort((a, b) => a.path.localeCompare(b.path));
   }
 
@@ -268,23 +320,26 @@ export class Storage115Simulator implements StorageV2 {
     file.name = input.newName;
   }
 
-  /** Recursive subdirectories of a directory, path-relative to it. */
-  async listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>> {
+  /** Recursive subdirectories of a directory, path-relative to it.
+   *  Root is depth 1; a directory past maxDepth is not opened. Default 6. */
+  async listSubdirectories(input: { directoryId: string; maxDepth?: number }): Promise<Array<{ id: string; path: string }>> {
     if (!this.dirs.has(input.directoryId)) {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
     }
     this.spendBudget(1);
+    const maxDepth = input.maxDepth ?? 6;
     const out: Array<{ id: string; path: string }> = [];
-    const walk = (dirId: string, prefix: string): void => {
+    const walk = (dirId: string, prefix: string, depth: number): void => {
+      if (depth > maxDepth) return;
       for (const dir of this.dirs.values()) {
         if (dir.parentId === dirId) {
           const path = `${prefix}${dir.name}`;
           out.push({ id: dir.id, path });
-          walk(dir.id, `${path}/`);
+          walk(dir.id, `${path}/`, depth + 1);
         }
       }
     };
-    walk(input.directoryId, "");
+    walk(input.directoryId, "", 1);
     return out.sort((a, b) => a.path.localeCompare(b.path));
   }
 
@@ -293,7 +348,10 @@ export class Storage115Simulator implements StorageV2 {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
     }
     // Collect the directory + all descendant dirs, then drop their files + the dirs.
-    const toRemove = [input.directoryId, ...(await this.listSubdirectories({ directoryId: input.directoryId })).map((d) => d.id)];
+    const toRemove = [
+      input.directoryId,
+      ...(await this.listSubdirectories({ directoryId: input.directoryId, maxDepth: Number.MAX_SAFE_INTEGER })).map((d) => d.id),
+    ];
     const removeSet = new Set(toRemove);
     const removed: string[] = [];
     this.spendBudget(toRemove.length);

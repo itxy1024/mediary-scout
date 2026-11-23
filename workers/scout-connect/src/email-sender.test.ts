@@ -1,5 +1,39 @@
-import { describe, expect, it } from "vitest";
-import { expiryReminderText } from "./email-sender.js";
+import { describe, expect, it, vi } from "vitest";
+import { createEmailSender, expiryReminderText } from "./email-sender.js";
+
+describe("createEmailSender", () => {
+  it("uses Cloudflare Email Service binding when provided", async () => {
+    const send = vi.fn(async () => ({ messageId: "msg_exp_1" }));
+    await createEmailSender({ send })({
+      to: "user@example.com",
+      subject: "到期提醒",
+      text: "即将到期",
+    });
+    expect(send).toHaveBeenCalledWith({
+      from: { email: "noreply@mediaryconnect.app", name: "Mediary Connect" },
+      to: "user@example.com",
+      subject: "到期提醒",
+      text: "即将到期",
+    });
+  });
+
+  it("logs and throws when Cloudflare Email Service binding fails", async () => {
+    const err = Object.assign(new Error("daily limit"), { code: "E_DAILY_LIMIT_EXCEEDED" });
+    const send = vi.fn(async () => {
+      throw err;
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(
+      createEmailSender({ send })({
+        to: "user@example.com",
+        subject: "到期提醒",
+        text: "即将到期",
+      }),
+    ).rejects.toThrow("cf email failed: E_DAILY_LIMIT_EXCEEDED (daily limit)");
+    expect(error).toHaveBeenCalledWith("cf email failed, code:", "E_DAILY_LIMIT_EXCEEDED (daily limit)");
+    error.mockRestore();
+  });
+});
 
 describe("expiryReminderText", () => {
   it("包含到期日、剩余天数、宽限语义、续期入口", () => {
@@ -11,15 +45,19 @@ describe("expiryReminderText", () => {
     expect(text).toContain("2026-08-06");
     expect(text).toContain("还有 7 天");
     expect(text).toContain("7 天宽限期");
-    // 必须写清「立即回收」与「续期需重跑接入命令」—— 与新条款措辞一致,
-    // 否则用户以为续期即自动恢复。
+    // 提醒发出时地址还在用：宽限期满前续期什么都不用做；
+    // 只有宽限期满、地址被收回之后再续期，才要在控制台点恢复，再接入一次。
+    expect(text).toContain("宽限期满前续期,一切照旧");
     expect(text).toContain("回收隧道");
-    expect(text).toContain("重跑一次一行接入命令");
+    expect(text).toContain("那之后续期,在控制台点「恢复原地址」");
+    expect(text).not.toContain("续期后在控制台点「恢复原地址」");
+    expect(text).not.toContain("需重跑一次一行接入命令");
     expect(text).toContain("alice.mediaryconnect.app");
     expect(text).toContain("/pricing");
     expect(text).toContain("/login");
     expect(text).toContain("DF Digital");
-    expect(text).toContain("支付宝");
+    expect(text).toContain("Waffo.com Limited");
+    expect(text).toContain("微信支付");
     expect(text).not.toContain("Paddle");
   });
 

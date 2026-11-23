@@ -9,7 +9,7 @@
  * crc32-based signPath signature (the {k,v} pair is injected into the query) plus
  * a fixed header set. There is NO token-refresh endpoint on the web face (all
  * refresh_token flows live on open-api.123pan.com, unrelated to 转存), so a dead
- * token cannot self-heal here: `code===401` throws Pan123AuthError and the upstream
+ * token cannot self-heal here: code 401 / 20101 (see PAN123_AUTH_CODES) throws Pan123AuthError and the upstream
  * registry freezes the connection for the user to re-scan. (This is why there is no
  * onCredentialRefresh / login_another / retry logic — nothing to refresh with.)
  *
@@ -19,6 +19,8 @@
  * nothing. The fix: stringify these id fields BEFORE JSON.parse. `parsePan123Json`
  * is the SINGLE json-parse entry point — no response is ever handed to raw JSON.parse.
  */
+
+import { parseFiniteMetric } from "./domain.js";
 
 const API_BASE = "https://yun.123pan.com/b/api";
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -61,10 +63,10 @@ export function signPath(path: string): { k: string; v: string } {
 
 /** id 字段名:123 的这些字段是 18 位 int64,JSON.parse 前必须先转字符串防精度丢失。
  *  ⚠️ 全 client 唯一的解析入口,任何响应都走它。字段清单以真跑通的探针 BIGINT 常量为准,
- *  额外加 `\s*` 容错(JSON 允许冒号前后空白)。`id`/`task_id` 覆盖离线 resolve/submit/list
- *  响应(OpenList drivers/123);仅匹配 ≥16 位所以不会把 Size/progress 当 id。 */
+ *  额外加 `\s*` 容错(JSON 允许冒号前后空白)。`id`/`task_id`/`resource_id` 覆盖离线
+ *  resolve/submit/list 响应(OpenList drivers/123);仅匹配 ≥16 位所以不会把 Size/progress 当 id。 */
 const BIGINT_ID_FIELDS =
-  /"(FileId|fileId|ShareId|shareId|file_id|parent_file_id|task_id|id)"\s*:\s*(\d{16,})/g;
+  /"(FileId|fileId|ShareId|shareId|file_id|parent_file_id|task_id|resource_id|id)"\s*:\s*(\d{16,})/g;
 
 /** 唯一 JSON 解析入口:先把大整数 id 字段加引号转字符串,再 parse。见文件头「root cause」。 */
 export function parsePan123Json(text: string): unknown {
@@ -73,6 +75,32 @@ export function parsePan123Json(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+/** The inverse of parsePan123Json for REQUEST bodies. 123's file/trash only acts
+ *  on a JSON-number FileId (a string id is silently ignored — live-isolated
+ *  2026-09-20), yet an 18-digit int64 cannot round-trip through Number(). So the
+ *  body is built with a unique placeholder string per id, stringified, and each
+ *  placeholder is then replaced by the bare digit literal (unquoted). Ids are
+ *  validated as pure digits first: a non-numeric id would otherwise be spliced in
+ *  as invalid JSON. */
+const NUMERIC_ID_PLACEHOLDER = "\u0000pan123-numeric-id:";
+
+export function numericIdPlaceholder(id: string): string {
+  // Digits only AND no leading zero: `007` spliced in bare is not a JSON number
+  // (123 would reject/misparse it); a lone `0` (the root folder) stays valid.
+  if (!/^(?:0|[1-9]\d*)$/.test(id)) {
+    throw new Error(`PAN123_BAD_ID: expected a numeric 123 file id, got ${JSON.stringify(id)}`);
+  }
+  return `${NUMERIC_ID_PLACEHOLDER}${id}`;
+}
+
+export function rawJsonWithNumericIds(body: unknown, ids: string[]): string {
+  let raw = JSON.stringify(body);
+  for (const id of ids) {
+    raw = raw.split(JSON.stringify(numericIdPlaceholder(id))).join(id);
+  }
+  return raw;
 }
 
 /** providerUid = JWT payload 的 `id`(稳定数字用户 id)。非 JWT/空 → null。
@@ -104,6 +132,12 @@ export class Pan123AuthError extends Error {
     this.name = "Pan123AuthError";
   }
 }
+
+/** Envelope codes that mean "this token is no longer logged in". 401 = token invalid /
+ *  expired. 20101 = 未登录: seen in production (2026-09-30) on a 90-day token still inside
+ *  its lifetime, i.e. the session was kicked off (the 123 App's device list, or another
+ *  login pushing it out). Both need a re-scan, so both freeze the drive. */
+const PAN123_AUTH_CODES = new Set([401, 20101]);
 
 export function isPan123AuthError(error: unknown): error is Pan123AuthError {
   return error instanceof Pan123AuthError;
@@ -155,13 +189,15 @@ export class Pan123Client {
   // ── 传输(signPath 签名 + envelope 判定) ──────────────────────────────────
 
   /** 组装签名请求 + envelope 判定。返回响应顶层对象(含 code/data)。
-   *  code===0 成功;code===401 → Pan123AuthError(死 token,不重试/不刷新);其它非 0 → 普通 Error。 */
+   *  code===0 成功;code 401/20101 → Pan123AuthError(死 token,不重试/不刷新);其它非 0 → 普通 Error。 */
   private async signed(
     path: string,
     init: {
       method: "GET" | "POST";
       query?: Record<string, string>;
       body?: unknown;
+      /** Pre-serialised JSON body (bigint-safe numeric ids spliced in). Wins over `body`. */
+      rawBody?: string;
       timeoutMs?: number;
     },
   ): Promise<Record<string, unknown>> {
@@ -173,20 +209,48 @@ export class Pan123Client {
     }
     const s = signPath(u.pathname);
     u.searchParams.set(s.k, s.v);
-    const res = await this.fetchImpl(u.toString(), {
-      method: init.method,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        platform: "web",
-        "app-version": "3",
-        "content-type": "application/json;charset=UTF-8",
-        origin: "https://yun.123pan.com",
-        referer: "https://yun.123pan.com/",
-        "user-agent": "Mozilla/5.0",
-      },
-      ...(init.timeoutMs !== undefined ? { timeoutMs: init.timeoutMs } : {}),
-      ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
-    });
+    let res: { status: number; text: string };
+    try {
+      res = await this.fetchImpl(u.toString(), {
+        method: init.method,
+        headers: {
+          authorization: `Bearer ${this.token}`,
+          platform: "web",
+          "app-version": "3",
+          "content-type": "application/json;charset=UTF-8",
+          origin: "https://yun.123pan.com",
+          referer: "https://yun.123pan.com/",
+          "user-agent": "Mozilla/5.0",
+        },
+        ...(init.timeoutMs !== undefined ? { timeoutMs: init.timeoutMs } : {}),
+        ...(init.rawBody !== undefined
+          ? { body: init.rawBody }
+          : init.body !== undefined
+            ? { body: JSON.stringify(init.body) }
+            : {}),
+      });
+    } catch (error) {
+      // A bare "The operation was aborted due to timeout" reads like the LLM timed out
+      // (《出入平安》 2026-09-24: 123's API hung for hours and the user suspected the
+      // model). Name the brand + host + path; keep the original message (the transient
+      // classifier matches on it) and the cause. The URL's query (signature) and the
+      // token header are never included.
+      const name = error instanceof Error ? error.name : "Error";
+      // undici quotes an invalid header VALUE in its message ('"Bearer <token>" is an
+      // invalid header value'), and this message is persisted and pushed — so the
+      // token is removed before it can travel. The cause keeps the raw error in-process.
+      let message = error instanceof Error ? error.message : String(error);
+      // Masked wherever it appears as a whole token-shaped run (bounded by characters
+      // that cannot be part of a JWT/base64url token), so any length is covered and a
+      // short token never shreds ordinary words ("t" inside "timeout" is not a match).
+      if (this.token) {
+        const escaped = this.token.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&");
+        // "=" can only TRAIL a base64 value (padding), never lead one — so it is a
+        // boundary on the left (token=<t> must still be masked) but not on the right.
+        message = message.replace(new RegExp(`(?<![A-Za-z0-9._~+/-])${escaped}(?![A-Za-z0-9._~+/=-])`, "g"), "***");
+      }
+      throw new Error(`PAN123_REQUEST_FAILED(${u.host} ${u.pathname}): ${name} ${message}`, { cause: error });
+    }
     const parsed = parsePan123Json(res.text);
     // Fail LOUD on a non-JSON body (WAF/gateway/challenge HTML, transient 5xx) —
     // never null→{}→code=0=空成功, or an upstream outage / GFW block masquerades as
@@ -201,7 +265,7 @@ export class Pan123Client {
       throw new Error(`PAN123_HTTP_FAILED: status=${res.status} missing code`);
     }
     const code = numOf(data["code"]);
-    if (code === 401) {
+    if (PAN123_AUTH_CODES.has(code)) {
       throw new Pan123AuthError(`PAN123_AUTH_FAILED: ${strOf(data["message"])}`);
     }
     if (code !== 0) {
@@ -341,21 +405,46 @@ export class Pan123Client {
     if (entries.length === 0) {
       return;
     }
-    await this.signed("/file/trash", {
+    // ⚠️ FileId MUST be a JSON NUMBER here. LIVE-ISOLATED 2026-09-20 (production
+    // container, real drive, every field combination): `"FileId":"57162650"` →
+    // code:0 / InfoList:[] / nothing deleted; `"FileId":57162650` → code:0 /
+    // InfoList:[{FileId}] / gone. The endpoint neither errors nor flags the string
+    // form — it just ignores the entry. Our bigint-safe habit of shipping ids as
+    // strings therefore made EVERY 123 delete a silent no-op (80 leaked staging
+    // dirs / ~1.4 TB). The id is spliced into the body as a raw digit literal so
+    // an 18-digit int64 survives without Number() rounding (the same bigint rule
+    // as parsePan123Json, in the other direction).
+    const resp = await this.signed("/file/trash", {
       method: "POST",
-      body: {
-        driveId: 0,
-        event: "intoRecycle",
-        operation: true,
-        // file/trash 权威接口只需 FileId(FileName 可选)。removeDirectory 只有 id,
-        // 故 name 缺省时省略 FileName 键(别发空串/undefined)。
-        fileTrashInfoList: entries.map((e) => ({
-          FileId: e.id,
-          ...(e.name ? { FileName: e.name } : {}),
-          Type: e.isFolder ? 1 : 0,
-        })),
-      },
+      rawBody: rawJsonWithNumericIds(
+        {
+          driveId: 0,
+          event: "intoRecycle",
+          operation: true,
+          fileTrashInfoList: entries.map((e) => ({
+            FileId: numericIdPlaceholder(e.id),
+            ...(e.name ? { FileName: e.name } : {}),
+            Type: e.isFolder ? 1 : 0,
+          })),
+        },
+        entries.map((e) => e.id),
+      ),
     });
+    // The ONLY success signal the endpoint gives is echoing each acted-on id in
+    // data.InfoList. A code:0 with a missing echo is exactly the silent-no-op
+    // shape above — fail loud so a leak can never again hide behind {removed:true}.
+    const data = (resp["data"] ?? {}) as Record<string, unknown>;
+    const echoed = new Set(
+      (Array.isArray(data["InfoList"]) ? (data["InfoList"] as unknown[]) : []).map((it) =>
+        strId((it as Record<string, unknown>)["FileId"]),
+      ),
+    );
+    const missing = entries.map((e) => e.id).filter((id) => !echoed.has(id));
+    if (missing.length > 0) {
+      throw new Error(
+        `PAN123_TRASH_NOOP: file/trash answered code:0 but did not act on ${missing.join(",")} (InfoList echo missing)`,
+      );
+    }
   }
 
   async moveFiles(input: { fileIds: string[]; targetParentId: string }): Promise<void> {
@@ -383,8 +472,10 @@ export class Pan123Client {
   // Ported from OpenList drivers/123 OfflineDownload. Status codes observed there:
   // 0=downloading, 1=failed, 2=succeed (3 may appear as retrying on open-api face).
 
-  /** Resolve a magnet/ed2k/http URL into a resource_id + selectable file ids. */
-  async resolveOffline(url: string): Promise<{ resourceId: string; fileIds: string[] }> {
+  /** Resolve a magnet/ed2k/http URL into a resource_id + selectable file ids.
+   *  `name` = the file name 123 will land under (the url's decoded path segment;
+   *  an http task lands it directly in upload_dir). */
+  async resolveOffline(url: string): Promise<{ resourceId: string; fileIds: string[]; resolvedName?: string }> {
     const resp = await this.signed("/v2/offline_download/task/resolve", {
       method: "POST",
       body: { urls: url },
@@ -416,7 +507,8 @@ export class Pan123Client {
     if (fileIds.length === 0) {
       throw new Error("PAN123_OFFLINE_RESOLVE_FAILED: empty file list");
     }
-    return { resourceId, fileIds };
+    const resolvedName = strOf(first["name"]);
+    return { resourceId, fileIds, ...(resolvedName ? { resolvedName } : {}) };
   }
 
   /** Submit a previously-resolved offline resource into `uploadDirId`. Returns taskId. */
@@ -501,6 +593,44 @@ export class Pan123Client {
     return null;
   }
 
+  /** Rows for a SET of task ids (the subtitle batch polls all its tasks with one
+   *  round of paging). Same endpoint/paging as getOfflineTask; stops as soon as
+   *  every wanted id has been seen, and never reads more than `maxPages` pages
+   *  (default 3 = 300 newest tasks — ours are the newest; a huge account queue
+   *  must not turn one poll into 50 requests). Missing ids are simply absent.
+   *  task/list is newest-first (live 2026-09-22: tasks submitted seconds earlier
+   *  head page 1), so maxPages 3 covers a batch; the executor claims from the
+   *  directory anyway, so a task missing from these pages is not a lost landing. */
+  async listOfflineTasks(taskIds: string[], opts?: { maxPages?: number }): Promise<Pan123OfflineTask[]> {
+    const wanted = new Set(taskIds.filter((id) => id.length > 0));
+    if (wanted.size === 0) {
+      return [];
+    }
+    const maxPages = opts?.maxPages ?? 3;
+    const pageSize = 100;
+    const found: Pan123OfflineTask[] = [];
+    for (let page = 1; page <= maxPages; page++) {
+      const resp = await this.signed("/offline_download/task/list", {
+        method: "POST",
+        body: { current_page: page, page_size: pageSize, status_arr: [0, 1, 2, 3] },
+      });
+      const data = (resp["data"] ?? {}) as Record<string, unknown>;
+      const list = Array.isArray(data["list"]) ? (data["list"] as unknown[]) : [];
+      for (const raw of list) {
+        const t = mapOfflineTask(raw);
+        if (wanted.has(t.taskId)) {
+          found.push(t);
+          wanted.delete(t.taskId);
+        }
+      }
+      const total = numOf(data["total"]);
+      if (wanted.size === 0 || list.length === 0 || page * pageSize >= total) {
+        break;
+      }
+    }
+    return found;
+  }
+
   /** Best-effort delete of finished/failed offline tasks (free quota). */
   async deleteOfflineTasks(taskIds: string[]): Promise<void> {
     if (taskIds.length === 0) {
@@ -514,6 +644,19 @@ export class Pan123Client {
       method: "POST",
       body: { task_ids: ids },
     });
+  }
+
+  /** Query total and used storage capacity (`GET /b/api/user/info`). */
+  async getSpace(): Promise<{ totalBytes: number; usedBytes: number } | null> {
+    const resp = await this.signed("/user/info", { method: "GET" });
+    const rawData = resp["data"];
+    const data = typeof rawData === "object" && rawData !== null ? (rawData as Record<string, unknown>) : {};
+    const totalBytes = parseFiniteMetric(data["SpacePermanent"]);
+    const usedBytes = parseFiniteMetric(data["SpaceUsed"]);
+    if (!Number.isFinite(totalBytes) || !Number.isFinite(usedBytes) || totalBytes <= 0) {
+      return null;
+    }
+    return { totalBytes, usedBytes };
   }
 }
 

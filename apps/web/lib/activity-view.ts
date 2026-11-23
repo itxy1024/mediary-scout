@@ -1,22 +1,26 @@
 import {
+  isUserVisibleWorkflowKind,
   landedSize,
   type MediaType,
   type NotificationReportStatus,
+  type WorkflowKind,
   type WorkflowRepository,
   type WorkflowRunProgress,
 } from "@media-track/workflow";
-import { distinctSeasons, seasonLabelText } from "./activity-season-label";
-import { manualSelectionResourcePickerHref } from "./resource-picker-link";
+import { activeRunLabel, distinctSeasons, seasonLabelText } from "./activity-season-label";
 
 // Re-export the pure season-label helpers so existing server-side imports from
 // this module keep working. The CANONICAL home is the runtime-free
 // `activity-season-label.ts` — the "use client" activity-feed must import from
 // there (not here), since this module pulls the Postgres-backed runtime.
-export { distinctSeasons, seasonLabelText };
+export { activeRunLabel, distinctSeasons, seasonLabelText };
 
 /** One title currently in the pipeline (queued or running). */
 export interface ActivityActiveRun {
   runId: string;
+  /** What the run does. Cancelling a queued acquisition takes the title out of the
+   *  library; cancelling a replace_request only drops that attempt (the feed says so). */
+  kind: WorkflowKind;
   tmdbId: number;
   title: string;
   year: number | null;
@@ -24,17 +28,21 @@ export interface ActivityActiveRun {
   posterPath: string | null;
   /** The snapshot's primary/placeholder season number (`snapshot.season`). May
    *  be a real number even for a whole-show ("全季") run, where it's just the
-   *  scope's anchor season — NOT the full set of covered seasons. null only for
-   *  movies / season-less snapshots. For display, prefer `seasonNumbers`. */
+   *  scope's anchor season — NOT the full set of covered seasons. null for
+   *  movies / season-less snapshots, and for a replace_request run (title-level:
+   *  its snapshot season is only where the title lock sits). For display, prefer
+   *  `seasonNumbers` (activeRunLabel). */
   seasonNumber: number | null;
   /** The distinct, sorted seasons the run actually covers, derived from its
    *  episode set. This is what the UI labels (e.g. "第 1/2/3/4 季"); a 全季 run
-   *  spans many seasons even though `seasonNumber` is a single anchor value. */
+   *  spans many seasons even though `seasonNumber` is a single anchor value.
+   *  [] for a replace_request run, which reads 「换源」 instead. */
   seasonNumbers: number[];
   status: "queued" | "running";
   /** 1-based position among queued items; null for the running one. */
   queuePosition: number | null;
-  /** Aired-but-not-obtained episodes still needed. */
+  /** Aired-but-not-obtained episodes still needed. 0 for a replace_request run:
+   *  its snapshot holds only the lock season's episodes, not what it looks for. */
   missingCount: number;
   /** Live agent progress (running only). */
   progress: WorkflowRunProgress | null;
@@ -51,8 +59,6 @@ export interface ActivityCompletedItem {
   /** "每集 约 410 MB" / "体积 1.4 GB"; null when unknown. */
   sizeText: string | null;
   createdAt: string;
-  /** 手选资源失败时回到同一范围重新选择；自动任务没有该入口。 */
-  reselectHref: string | null;
 }
 
 export interface ActivityView {
@@ -71,7 +77,7 @@ export interface ActivityView {
 export async function getActivityView(input: {
   repository: Pick<
     WorkflowRepository,
-    "listActiveWorkflowRuns" | "listNotifications" | "listTrackedSeasonStates" | "getWorkflowRunSnapshot"
+    "listActiveWorkflowRuns" | "listNotifications" | "listTrackedSeasonStates"
   >;
   /** Scope the queue/notifications to one account (§7). Omitted → default. */
   accountId?: string;
@@ -82,7 +88,9 @@ export async function getActivityView(input: {
     input.accountId === undefined
       ? undefined
       : { accountId: input.accountId, connectedStorageId: input.connectedStorageId ?? null };
-  const activeRuns = await input.repository.listActiveWorkflowRuns(scope);
+  const activeRuns = (await input.repository.listActiveWorkflowRuns(scope)).filter((snapshot) =>
+    isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
+  );
 
   // Poster backfill source: older notifications predate report.posterPath, so a
   // completed item can lack a poster. The title is still tracked → source the
@@ -106,19 +114,23 @@ export async function getActivityView(input: {
 
   const active: ActivityActiveRun[] = activeRuns.map((snapshot) => {
     const status = snapshot.workflowRun.status === "running" ? "running" : "queued";
-    const missingCount = snapshot.episodes.filter(
-      (episode) => episode.airStatus === "aired" && !episode.obtained,
-    ).length;
+    // A replace run covers the whole title; its snapshot is only the lock season's
+    // (an S02E01 request would read 「第 1 季」 with S01's missing count).
+    const titleLevel = snapshot.workflowRun.kind === "replace_request";
+    const missingCount = titleLevel
+      ? 0
+      : snapshot.episodes.filter((episode) => episode.airStatus === "aired" && !episode.obtained).length;
     const queueIndex = queuedOrder.indexOf(snapshot.workflowRun.id);
     return {
       runId: snapshot.workflowRun.id,
+      kind: snapshot.workflowRun.kind,
       tmdbId: snapshot.title.tmdbId,
       title: snapshot.title.title,
       year: snapshot.title.year ?? null,
       type: snapshot.title.type,
       posterPath: snapshot.title.posterPath ?? null,
-      seasonNumber: snapshot.season.seasonNumber ?? null,
-      seasonNumbers: distinctSeasons(snapshot.episodes),
+      seasonNumber: titleLevel ? null : snapshot.season.seasonNumber ?? null,
+      seasonNumbers: titleLevel ? [] : distinctSeasons(snapshot.episodes),
       status,
       queuePosition: status === "queued" && queueIndex >= 0 ? queueIndex + 1 : null,
       missingCount,
@@ -136,12 +148,9 @@ export async function getActivityView(input: {
       ? { accountId: input.accountId, connectedStorageId: input.connectedStorageId ?? null }
       : {}),
   });
-  const recentCompleted: ActivityCompletedItem[] = await Promise.all(
-    notifications
-      .filter(
-        (notification) => notification.kind !== "already_current" && notification.report !== undefined,
-      )
-      .map(async (notification) => {
+  const recentCompleted: ActivityCompletedItem[] = notifications
+    .filter((notification) => notification.kind !== "already_current" && notification.report !== undefined)
+    .map((notification) => {
       const report = notification.report!;
       const size = landedSize(report);
       const posterPath =
@@ -149,11 +158,6 @@ export async function getActivityView(input: {
         (report.tmdbId != null ? posterByTmdb.get(report.tmdbId) : undefined) ??
         posterByName.get(report.titleName) ??
         null;
-      const snapshot = await input.repository.getWorkflowRunSnapshot(notification.workflowRunId, scope);
-      const reselectHref = manualSelectionResourcePickerHref(
-        snapshot?.resourceSnapshots ?? [],
-        snapshot?.connectedStorageId,
-      );
       return {
         workflowRunId: notification.workflowRunId,
         title: report.titleName,
@@ -162,17 +166,11 @@ export async function getActivityView(input: {
         posterPath,
         sizeText: size ? `${size.label} ${size.value}` : null,
         createdAt: notification.createdAt,
-        reselectHref:
-          reselectHref && (report.status === "failed" || report.status === "no_coverage")
-            ? reselectHref
-            : null,
       };
-      }),
-  );
+    });
 
   return { active, recentCompleted };
 }
-
 
 /** Why `POST /api/activity/retry` refused. Shared by the route and the activity
  *  feed so both sides compare against the same literals — a hand-written string

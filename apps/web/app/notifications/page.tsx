@@ -12,16 +12,17 @@ import {
   Film,
   Layers,
   PartyPopper,
+  Repeat,
   RotateCcw,
-  Search,
   TriangleAlert,
   XCircle,
 } from "lucide-react";
 import type { NotificationEvent, NotificationReportStatus } from "@media-track/workflow";
-import { landedSize } from "@media-track/workflow";
+import { getStorageBrand, isRegisteredStorageProvider, landedSize } from "@media-track/workflow";
 import { NotificationsSeenMarker } from "../../components/notifications-seen-marker";
 import { DemoSessionNotifications } from "../../components/demo-session-notifications";
 import { AppSidebar } from "../../components/app-sidebar";
+import { GitHubNameplate } from "../../components/github-nameplate";
 import {
   ensureDemoSeeded,
   getCurrentAccountId,
@@ -29,7 +30,6 @@ import {
   notificationWindowSince,
   resolveGlobalWorkspace,
 } from "../../lib/workflow-runtime";
-import { manualSelectionResourcePickerHref } from "../../lib/resource-picker-link";
 
 // The kind only drives the leading ICON now — its textual label used to render
 // as a second badge next to the status pill ("开始追踪" beside "已完结"), which
@@ -47,6 +47,7 @@ const kindIcon: Record<string, { tone: string; icon: typeof Bell }> = {
   already_current: { tone: "muted", icon: CheckCircle2 },
   no_coverage: { tone: "amber", icon: CircleSlash },
   transfer_failed: { tone: "amber", icon: XCircle },
+  replacement_done: { tone: "indigo", icon: Repeat },
   foreign_work_detected: { tone: "amber", icon: Film },
 };
 
@@ -58,6 +59,7 @@ const statusMeta: Record<NotificationReportStatus, { label: string; tone: string
   no_coverage: { label: "暂无资源", tone: "amber", icon: CircleSlash },
   failed: { label: "获取失败", tone: "amber", icon: XCircle },
   retrying: { label: "重试中", tone: "indigo", icon: RotateCcw },
+  replaced: { label: "已换源", tone: "green", icon: Repeat },
 };
 
 // `searchParams` (the active drive `?w`) is a dynamic input + a DB read; reading it
@@ -102,6 +104,7 @@ async function NotificationsSurface({ searchParams }: { searchParams: Promise<{ 
         <Suspense fallback={<FeedSkeleton />}>
           <NotificationFeed connectedStorageId={workspace.connectedStorageId} />
         </Suspense>
+        <GitHubNameplate />
       </main>
     </div>
   );
@@ -126,6 +129,15 @@ async function NotificationFeed({ connectedStorageId }: { connectedStorageId: st
   // poster from the still-tracked title (by tmdbId, then name) so cards show a
   // real poster instead of nothing.
   const trackedStates = await repository.listTrackedSeasonStates({ accountId, connectedStorageId });
+  const storages = await repository.listConnectedStorages(accountId);
+  const driveLabelById = new Map<string, string>();
+  for (const s of storages) {
+    const nickname = s.label?.trim();
+    const brandName = isRegisteredStorageProvider(s.provider)
+      ? getStorageBrand(s.provider).label.replace(/\s*(?:网盘|云盘)$/, "")
+      : s.provider;
+    driveLabelById.set(s.id, nickname || brandName);
+  }
   const posterByTmdb = new Map<number, string>();
   const posterByName = new Map<string, string>();
   for (const state of trackedStates) {
@@ -150,22 +162,6 @@ async function NotificationFeed({ connectedStorageId }: { connectedStorageId: st
     );
   }
 
-  const reselectByNotificationId = new Map<string, string>();
-  for (const notification of notifications) {
-    if (notification.report?.status !== "failed" && notification.report?.status !== "no_coverage") {
-      continue;
-    }
-    const snapshot = await repository.getWorkflowRunSnapshot(notification.workflowRunId, {
-      accountId,
-      connectedStorageId,
-    });
-    const href = manualSelectionResourcePickerHref(
-      snapshot?.resourceSnapshots ?? [],
-      snapshot?.connectedStorageId,
-    );
-    if (href) reselectByNotificationId.set(notification.id, href);
-  }
-
   const days = buildDays(notifications);
   return (
     <section className="feed">
@@ -186,7 +182,11 @@ async function NotificationFeed({ connectedStorageId }: { connectedStorageId: st
                   fallbackPoster={
                     block.notification.report ? fallbackPoster(block.notification.report) : null
                   }
-                  reselectHref={reselectByNotificationId.get(block.notification.id) ?? null}
+                  fallbackDriveLabel={
+                    block.notification.connectedStorageId
+                      ? driveLabelById.get(block.notification.connectedStorageId) ?? null
+                      : null
+                  }
                 />
               ),
             )}
@@ -201,11 +201,11 @@ async function NotificationFeed({ connectedStorageId }: { connectedStorageId: st
 function NotificationCard({
   notification,
   fallbackPoster = null,
-  reselectHref = null,
+  fallbackDriveLabel = null,
 }: {
   notification: NotificationEvent;
   fallbackPoster?: string | null;
-  reselectHref?: string | null;
+  fallbackDriveLabel?: string | null;
 }) {
   const icon = kindIcon[notification.kind] ?? { tone: "muted", icon: Bell };
   const KindIcon = icon.icon;
@@ -249,7 +249,24 @@ function NotificationCard({
   // informative progress line(s).
   const lines = report.status === "acquired" ? [] : report.lines;
   const size = landedSize(report);
-  const hasChips = report.newlyObtained.length > 0 || report.realMissing.length > 0 || Boolean(size);
+  let driveLabels: string[] = [];
+  if (report.driveLabels && report.driveLabels.length > 0) {
+    driveLabels = report.driveLabels;
+  } else if (
+    fallbackDriveLabel &&
+    (report.status === "acquired" ||
+      report.status === "complete" ||
+      report.status === "airing" ||
+      report.status === "partial" ||
+      report.status === "replaced")
+  ) {
+    driveLabels = [fallbackDriveLabel];
+  }
+  const hasChips =
+    report.newlyObtained.length > 0 ||
+    report.realMissing.length > 0 ||
+    Boolean(size) ||
+    driveLabels.length > 0;
   // The same TMDB poster the push uses — a small thumbnail turns the row into a
   // proper media card (parity with the WeChat/Bark notification).
   const posterPath = report.posterPath ?? fallbackPoster;
@@ -290,6 +307,18 @@ function NotificationCard({
         <div className="feed-card-chips">
           <ChipGroup label="本次新增" codes={report.newlyObtained} variant="is-new" />
           <ChipGroup label="缺集" codes={report.realMissing} variant="is-missing" />
+          {driveLabels.length > 0 ? (
+            <span className="feed-chip-group">
+              <span className="feed-chip-label">网盘</span>
+              <span className="feed-chips">
+                {driveLabels.map((dl) => (
+                  <span className="feed-chip" key={dl}>
+                    {dl}
+                  </span>
+                ))}
+              </span>
+            </span>
+          ) : null}
           {size ? (
             <span className="feed-chip-group">
               <span className="feed-chip-label">{size.label}</span>
@@ -300,10 +329,12 @@ function NotificationCard({
           ) : null}
         </div>
       ) : null}
-      {reselectHref ? (
-        <Link className="feed-action" href={reselectHref}>
-          <Search size={13} aria-hidden /> 重新选择资源
-        </Link>
+
+      {report.selectionPreference ? (
+        <details className="feed-pref-details">
+          <summary>选源要求</summary>
+          <p className="feed-pref-body">{report.selectionPreference}</p>
+        </details>
       ) : null}
       </div>
     </article>

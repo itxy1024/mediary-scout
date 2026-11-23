@@ -1,7 +1,32 @@
 import type { D1Database } from "./db.js";
 
+/** Cloudflare Email Service `send_email` binding 的最小类型声明（与 Workers 运行时签名一致）。 */
+export interface EmailAddress {
+  email: string;
+  name?: string;
+}
+
+export interface EmailMessageBuilder {
+  to: string | EmailAddress | Array<string | EmailAddress>;
+  from: string | EmailAddress;
+  subject: string;
+  html?: string;
+  text?: string;
+  cc?: string | EmailAddress | Array<string | EmailAddress>;
+  bcc?: string | EmailAddress | Array<string | EmailAddress>;
+  replyTo?: string | EmailAddress;
+  headers?: Record<string, string>;
+}
+
+export interface SendEmailBinding {
+  send(message: EmailMessageBuilder): Promise<{ messageId: string }>;
+}
+
 export interface Env {
   DB: D1Database;
+  // Cloudflare Email Sending 原生绑定（wrangler.jsonc send_email: [{ name: "EMAIL" }]）。
+  // 优先使用原生绑定发信（0 额外月费）；未绑定时回退 RESEND_API_KEY。
+  EMAIL?: SendEmailBinding;
   ADMIN_TOKEN: string;
   CF_API_TOKEN: string;
   CF_ACCOUNT_ID: string;
@@ -21,14 +46,14 @@ export interface Env {
   // 没配时 login 路径本就失败(那是核心功能),而 expiry sweep 只是不发提醒邮件,
   // 回收照走。让类型反映"某些路径可无"这个事实,而不是假设处处必填。
   RESEND_API_KEY?: string;
-  // 支付宝网页支付。四项都作为 Worker secrets 配置,源码和 wrangler vars
-  // 均不保存凭证。缺少任一项时购买入口明确显示不可用,所有支付接口 fail closed。
-  ALIPAY_APP_ID?: string;
-  ALIPAY_PRIVATE_KEY?: string;
-  ALIPAY_ALIPAY_PUBLIC_KEY?: string;
-  ALIPAY_SELLER_ID?: string;
-  /** "sandbox" is honored only for localhost requests; omit or use "production" in deploys. */
-  ALIPAY_ENVIRONMENT?: string;
+  // Waffo checkout configuration. Product/store ids are public vars; the private key is a Worker secret.
+  WAFFO_MERCHANT_ID?: string;
+  WAFFO_STORE_ID?: string;
+  WAFFO_ENVIRONMENT?: string;
+  WAFFO_PRODUCT_QUARTER?: string;
+  WAFFO_PRODUCT_YEAR?: string;
+  WAFFO_PRODUCT_TWO_YEARS?: string;
+  WAFFO_PRIVATE_KEY?: string;
   // 到期巡检是否真删。"true" 才开;任何其它值/未设 = dry-run 只记审计。
   // 四个 PR 里唯一会真删生产资源的路径,先在实例验证时间边界再放开。
   EXPIRY_SWEEP_LIVE?: string;

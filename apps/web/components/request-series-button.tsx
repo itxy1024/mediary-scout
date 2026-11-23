@@ -1,15 +1,14 @@
 "use client";
 
-import { Check, Layers, ListChecks, LoaderCircle } from "lucide-react";
+import { Check, Layers, LoaderCircle } from "lucide-react";
 import { useState, useTransition } from "react";
+import { requestSeriesAction, type RequestTrackingActionResult } from "../app/actions";
+import { runAction } from "../lib/run-action";
+import { AcquireResultNotice, isLockedResult } from "./request-state";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { DemoAcquirePlayback } from "./demo-acquire-playback";
 import type { DemoAcquisitionEntry } from "../lib/demo-session";
 import { useDemoAcquiredTmdbIds } from "../lib/use-demo-session";
-import { useRouter } from "next/navigation";
-import { resourcePickerHref } from "../lib/resource-picker-link";
-import { requestSeriesAction } from "../app/actions";
-import { runAction } from "../lib/run-action";
 
 export function RequestSeriesButton({
   candidateId,
@@ -23,9 +22,9 @@ export function RequestSeriesButton({
   /** Demo only: recorded to the session library when the scripted playback ends. */
   demoEntry?: DemoAcquisitionEntry | undefined;
 }) {
-  const router = useRouter();
   const [isPending, startTransition] = useTransition();
-  const [resultMessage, setResultMessage] = useState<string | null>(null);
+  const [result, setResult] = useState<RequestTrackingActionResult | null>(null);
+  const isLocked = isLockedResult(result);
   // Read-only demo: clicking plays the scripted playback (the server action is gated).
   const demo = isDemoModeClient();
   const [demoPlaying, setDemoPlaying] = useState(false);
@@ -44,50 +43,36 @@ export function RequestSeriesButton({
     );
   }
 
-  const tmdbId = Number(/^tmdb_tv_(\d+)/.exec(candidateId)?.[1]);
   return (
-    <div className="season-action-group">
+    <>
       <button
-        className="primary-button"
+        className="primary-button series-button"
         type="button"
-        title="检索全剧资源"
-        disabled={isPending}
+        title={result?.message ?? "获取全部季"}
+        disabled={isPending || isLocked}
         onClick={() => {
           if (demo) {
             setDemoPlaying(true);
             return;
           }
-          if (Number.isInteger(tmdbId) && tmdbId > 0) {
-            startTransition(async () => {
-              const result = await runAction(
-                () => requestSeriesAction({ candidateId, storageId }),
-                (message) => setResultMessage(message),
-              );
-              if (result.ok) {
-                setResultMessage(result.value.message);
-                router.refresh();
-              }
-            });
-          }
+          startTransition(async () => {
+            const r = await runAction(
+              () => requestSeriesAction({ candidateId, storageId }),
+              (msg) => setResult({ status: "unsupported", message: msg }),
+            );
+            if (!r.ok) return;
+            setResult(r.value);
+          });
         }}
       >
-        {isPending ? <LoaderCircle size={15} className="spin" aria-hidden /> : <Layers size={14} aria-hidden />}
-        {isPending ? "请求中" : "获取全剧"}
+        {isPending || isLocked ? (
+          <LoaderCircle size={14} className="spin" aria-hidden />
+        ) : (
+          <Layers size={14} aria-hidden />
+        )}
+        {isLocked ? "已请求" : "获取全剧"}
       </button>
-      <button
-        className="primary-button manual-acquire-button"
-        type="button"
-        disabled={isPending}
-        onClick={() => {
-          if (Number.isInteger(tmdbId) && tmdbId > 0) {
-            router.push(resourcePickerHref({ kind: "series", tmdbId, ...(storageId ? { storageId } : {}) }));
-          }
-        }}
-      >
-        <ListChecks size={15} aria-hidden />
-        手动获取
-      </button>
-      {resultMessage ? <p className="request-result">{resultMessage}</p> : null}
-    </div>
+      <AcquireResultNotice result={result} />
+    </>
   );
 }

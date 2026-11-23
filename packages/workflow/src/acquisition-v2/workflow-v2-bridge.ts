@@ -14,7 +14,8 @@ import {
   type TransferAttempt,
   type WorkflowStatus,
 } from "../domain.js";
-import { buildSeasonReport, buildSeriesReport, formatReportPushText } from "../notification-report.js";
+import { buildReplacementReport, buildSeasonReport, buildSeriesReport, formatReportPushText } from "../notification-report.js";
+import { appliedSelectionPreference } from "../selection-preference.js";
 import { classifyTransferBlock } from "./transfer-block.js";
 import { classifySearchSourceFault } from "./search-source-fault.js";
 import type { RunAcquisitionV2WorkflowResult } from "./workflow-v2.js";
@@ -41,14 +42,19 @@ function sizeInput(input: { fileCount?: number; totalBytes?: number }): {
     : {};
 }
 
-export type V2BridgeMode = "type2" | "series" | "type3";
+/** `replace` = a replace_request run (user message): multi-season like `series`, but
+ *  its notification reports what was replaced, never "入库". */
+export type V2BridgeMode = "type2" | "series" | "type3" | "replace" | "staging_recovery";
 
 export interface V2BridgeSeasonIntent {
   seasonNumber: number;
   totalEpisodes: number;
   latestAiredEpisode: number;
   qualityPreference: string;
-  /** Tracked status; defaults to completed when fully aired, else active. */
+  /** Persisted status of the season, if any. IGNORED for the completed decision:
+   *  bridgeSeason recomputes status purely from the obtained facts (a season is
+   *  completed iff fully acquired), so a stale "completed" never sticks a season
+   *  that still has a real gap. Kept only so callers can pass their row through. */
   status?: SeasonStatus;
 }
 
@@ -66,6 +72,10 @@ export interface BridgedV2Result {
   notification: NotificationEvent;
   notifications: NotificationEvent[];
   auditEvents: AuditEvent[];
+  /** Drives on which season target directories were materialized during this run. */
+  touchedTargetDrives?: RunAcquisitionV2WorkflowResult["touchedTargetDrives"];
+  /** Present only on a replace_request run (attached by runTvAcquisitionV2). */
+  replacement?: RunAcquisitionV2WorkflowResult["replacement"];
 }
 
 export function bridgeV2WorkflowToResult(input: {
@@ -94,12 +104,17 @@ export function bridgeV2WorkflowToResult(input: {
   // 下载配额不足 / 登录过期 / 非 VIP), report an honest "转存失败:<原因>" instead of
   // "暂未找到资源" — the resource exists, the account is blocked.
   const transferBlock = classifyTransferBlock(v2.outcome.transferAttempts);
-  const transferBlockReason = status === "no_coverage" && transferBlock ? transferBlock.reason : null;
+  // A replace run over a complete library is never "no_coverage" by episode count, yet
+  // a blocked transfer is still the honest reason nothing new landed.
+  const nothingLanded = status === "no_coverage" || input.mode === "replace";
+  const transferBlockReason = nothingLanded && transferBlock ? transferBlock.reason : null;
   // 同一条教义在更早一层:搜索源本轮全程故障时,一个候选都取不回来,集数算术
   // 于是判 no_coverage、用户读到「暂未找到可用资源」—— 真实案例里这样持续了
   // 6 天。判定读 sandbox 写下的结构化审计事件,不猜(见 classifySearchSourceFault)。
   const sourceFault = classifySearchSourceFault(v2.auditEvents);
-  const searchSourceFaultReason = status === "no_coverage" && sourceFault ? sourceFault.reason : null;
+  const searchSourceFaultReason = nothingLanded && sourceFault ? sourceFault.reason : null;
+
+  const selectionPreference = appliedSelectionPreference(v2.auditEvents);
 
   const notification = buildNotification({
     title,
@@ -111,7 +126,10 @@ export function bridgeV2WorkflowToResult(input: {
     newlyObtainedCodes,
     workflowRunId,
     now: input.now,
-    ...(v2.landedFileCount !== undefined && v2.landedBytes !== undefined
+    ...(selectionPreference ? { selectionPreference } : {}),
+    ...(v2.replacement ? { replacementResults: v2.replacement.results } : {}),
+    // A replace run's directories hold old + new files: a landed size would double-count.
+    ...(input.mode !== "replace" && v2.landedFileCount !== undefined && v2.landedBytes !== undefined
       ? { fileCount: v2.landedFileCount, totalBytes: v2.landedBytes }
       : {}),
   });
@@ -123,8 +141,10 @@ export function bridgeV2WorkflowToResult(input: {
     decisions: v2.outcome.decisions,
     transferAttempts: v2.outcome.transferAttempts,
     notification,
-    notifications: [notification],
+    // A leftover recovery is invisible: the run still reconciles, it does not tell anyone.
+    notifications: input.mode === "staging_recovery" ? [] : [notification],
     auditEvents: v2.auditEvents,
+    ...(v2.touchedTargetDrives ? { touchedTargetDrives: v2.touchedTargetDrives } : {}),
   };
 }
 
@@ -177,20 +197,27 @@ function bridgeSeason(input: {
     });
   }
 
+  // A season is "completed" ONLY when it is actually fully ACQUIRED — every
+  // aired episode obtained and the obtained count covering the whole season —
+  // never merely because every episode has AIRED. A 完结 (fully-aired) drama
+  // whose acquisition left gaps must stay "active" so the daily patrol keeps
+  // filling it; grading it "completed" on airing alone made the patrol skip it
+  // forever (这一秒过火 缺 1-13, 永不消逝的电波 缺全集, 醒来 缺 21).
+  //
+  // intent.status is deliberately NOT trusted here: this bridge is the sole
+  // post-creation writer of season.status, so it recomputes from the obtained
+  // facts. A stale "completed" therefore can never stick a season that still
+  // has a real gap, and if TMDB later grows the season the new gap correctly
+  // reverts it to active so the patrol resumes. The graduation season-sync.ts
+  // promises ("only the finale — all obtained — graduates it to completed")
+  // happens here: an active season that becomes fully obtained turns completed
+  // so the patrol stops re-sweeping a finished show and the library drops 追更中.
   const fullyAired = intent.totalEpisodes > 0 && intent.latestAiredEpisode >= intent.totalEpisodes;
-  const baseStatus: SeasonStatus = intent.status ?? (fullyAired ? "completed" : "active");
-  // The finale graduation season-sync.ts promises ("only the finale — all
-  // obtained — graduates it to completed"). Callers pass the persisted status
-  // through, and this bridge is the only post-creation writer of it — so an
-  // active season that is now fully aired AND fully obtained must graduate
-  // HERE, or the patrol re-sweeps a finished show daily and the library keeps
-  // 追更中 while the notification claims 不再追踪. A season with real aired
-  // gaps stays active so the sweep keeps filling them; completed never reverts.
   const fullyObtained =
     fullyAired &&
     episodes.filter((episode) => episode.airStatus === "aired").every((episode) => episode.obtained) &&
     episodes.filter((episode) => episode.obtained).length >= intent.totalEpisodes;
-  const status: SeasonStatus = baseStatus === "active" && fullyObtained ? "completed" : baseStatus;
+  const status: SeasonStatus = fullyObtained ? "completed" : "active";
 
   const season: TrackedSeason = {
     id: trackedSeasonId,
@@ -231,10 +258,41 @@ function buildNotification(input: {
   now: () => string;
   fileCount?: number;
   totalBytes?: number;
+  selectionPreference?: string;
+  /** replace mode: the per-episode outcome of the user's request. */
+  replacementResults?: Array<{ episode: string; outcome: "replaced" | "not_found" }>;
 }): NotificationEvent {
   const { title, mode, seasons, status, workflowRunId } = input;
   const noCoverage = status === "no_coverage";
-  const titleMeta = { posterPath: title.posterPath ?? null, tmdbId: title.tmdbId, mediaType: title.type, year: title.year };
+  const titleMeta = {
+    posterPath: title.posterPath ?? null,
+    tmdbId: title.tmdbId,
+    mediaType: title.type,
+    year: title.year,
+    ...(input.selectionPreference ? { selectionPreference: input.selectionPreference } : {}),
+  };
+
+  if (mode === "replace") {
+    const report = buildReplacementReport({
+      titleName: title.title,
+      movie: false,
+      results: input.replacementResults ?? [],
+      newlyObtained: input.newlyObtainedCodes,
+      transferBlockReason: input.transferBlockReason ?? null,
+      searchSourceFaultReason: input.searchSourceFaultReason ?? null,
+      meta: titleMeta,
+    });
+    return {
+      id: `notification_${workflowRunId}`,
+      workflowRunId,
+      kind: report.status === "failed" ? "transfer_failed" : "replacement_done",
+      title: report.titleName,
+      body: formatReportPushText(report),
+      createdAt: input.now(),
+      trigger: "user",
+      report,
+    };
+  }
 
   if (mode === "series") {
     const report = buildSeriesReport({

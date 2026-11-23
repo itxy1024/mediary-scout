@@ -2,7 +2,7 @@
 
 import { LoaderCircle, QrCode, RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 
 /** 123 的 QR session 是无状态的:{ uniID, qrcodeContent } 就是全部——没有天翼那种
  *  cookie jar 滚动回传,轮询只带 uniID,confirm 只带轮询拿到的 90 天 token。 */
@@ -47,7 +47,8 @@ export function Pan123QrConnect() {
     } catch (error) {
       if (generation.current !== myGen) return;
       setPhase("error");
-      setMessage(String(error));
+      // `String(Error)` yields "Error: <msg>"; strip it — shown verbatim.
+      setMessage(error instanceof Error ? error.message : String(error));
     }
   }
 

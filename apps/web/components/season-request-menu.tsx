@@ -1,15 +1,20 @@
 "use client";
 
-import { Check, ChevronDown, LoaderCircle, ListChecks, Plus } from "lucide-react";
+import { Check, ChevronDown, LoaderCircle, Plus } from "lucide-react";
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
-import { requestRemainingAction, requestSeasonAction } from "../app/actions";
+import { useRouter } from "../lib/use-router";
+import {
+  requestRemainingAction,
+  requestSeasonAction,
+  type RequestTrackingActionResult,
+} from "../app/actions";
 import { runAction } from "../lib/run-action";
+import { AcquireResultNotice, isLockedResult } from "./request-state";
+import { AcquireProgressBadge } from "./acquire-progress-badge";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { DemoAcquirePlayback } from "./demo-acquire-playback";
 import type { DemoAcquisitionEntry } from "../lib/demo-session";
 import { useDemoAcquiredTmdbIds } from "../lib/use-demo-session";
-import { resourcePickerHref } from "../lib/resource-picker-link";
 
 /**
  * Two-step acquisition entry for a tv title: the dropdown only SELECTS a
@@ -42,10 +47,14 @@ export function SeasonRequestMenu({
   demoEntry?: DemoAcquisitionEntry | undefined;
 }) {
   const router = useRouter();
+  const [isPending, startTransition] = useTransition();
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<number | "all">("all");
-  const [isPending, startTransition] = useTransition();
-  const [resultMessage, setResultMessage] = useState<string | null>(null);
+  // The scope ACTUALLY requested (set at submit). The single-season path requests
+  // `onlySeason` while `selected` stays "all", so the locked badge must read this,
+  // not `selected`, to match the right season's run.
+  const [requestedSeason, setRequestedSeason] = useState<number | "all">("all");
+  const [result, setResult] = useState<RequestTrackingActionResult | null>(null);
   // Read-only demo: any acquire trigger plays the scripted, client-only playback
   // (the server actions below are gated server-side anyway).
   const demo = isDemoModeClient();
@@ -65,59 +74,45 @@ export function SeasonRequestMenu({
     );
   }
 
-  const manualSubmit = (seasonNumber?: number) => {
-    if (demo) {
-      setDemoPlaying(true);
-      return;
-    }
-    setOpen(false);
-    const targetKind = seasonNumber !== undefined || selected !== "all" ? "season" : "remaining";
-    router.push(
-      resourcePickerHref({
-        kind: targetKind,
-        tmdbId,
-        ...(seasonNumber !== undefined ? { seasonNumber } : selected === "all" ? {} : { seasonNumber: selected }),
-        ...(storageId ? { storageId } : {}),
-      }),
+  if (isLockedResult(result)) {
+    // Match the SEASON that was just requested: a specific season → that number (so
+    // we don't show another season's running progress); "all remaining" → null
+    // (match any of this show's running seasons). → inline live progress while
+    // running, static 已请求 pill otherwise.
+    return (
+      <AcquireProgressBadge
+        tmdbId={tmdbId}
+        seasonNumber={requestedSeason === "all" ? null : requestedSeason}
+        storageId={storageId}
+        title={result?.message}
+      />
     );
-  };
+  }
 
-  const autoSubmit = (seasonNumber?: number) => {
+  const submit = () => {
     if (demo) {
       setDemoPlaying(true);
       return;
     }
-    setOpen(false);
-    setResultMessage(null);
+    setRequestedSeason(selected);
     startTransition(async () => {
-      const result = await runAction(
+      // setOpen(false) 必须先关菜单(状态机);失败也要关,否则菜单卡住。
+      setOpen(false);
+      // 必须 catch(见 runAction 注释)。失败走 onError 显示固定文案。
+      const r = await runAction(
         () =>
-          (seasonNumber ?? selected) === "all"
+          selected === "all"
             ? requestRemainingAction({ tmdbId, storageId })
-            : requestSeasonAction({ tmdbId, seasonNumber: Number(seasonNumber ?? selected), storageId }),
-        (message) => setResultMessage(message),
+            : requestSeasonAction({ tmdbId, seasonNumber: selected, storageId }),
+        (msg) => setResult({ status: "unsupported", message: msg }),
       );
-      if (result.ok) {
-        setResultMessage(result.value.message);
-        router.refresh();
-      }
+      if (!r.ok) return;
+      setResult(r.value);
+      // Re-fetch so the queued run mounts the AcquiringPoller; once it finishes,
+      // the acquired season leaves untrackedSeasons and this menu unmounts.
+      router.refresh();
     });
   };
-
-  const manualButton = (seasonNumber?: number) => (
-    <button
-      className="primary-button manual-acquire-button"
-      type="button"
-      disabled={isPending}
-      title="打开资源列表，手动选择要保存的候选"
-      onClick={() => {
-        manualSubmit(seasonNumber);
-      }}
-    >
-      <ListChecks size={15} aria-hidden />
-      手动获取
-    </button>
-  );
 
   if (seasonNumbers.length <= 1) {
     const onlySeason = seasonNumbers[0] ?? 1;
@@ -126,79 +121,96 @@ export function SeasonRequestMenu({
     // ambiguous bare "获取" sitting next to "第 1 季已获取".
     const isRemainingOfMany = totalSeasonCount > 1;
     return (
-      <div className="season-action-group">
+      <>
         <button
           className="primary-button"
           type="button"
           disabled={isPending}
           onClick={() => {
-            setSelected(onlySeason);
-            autoSubmit(onlySeason);
+            if (demo) {
+              setDemoPlaying(true);
+              return;
+            }
+            setRequestedSeason(onlySeason);
+            startTransition(async () => {
+              // 与多季路径保持一致:必须 catch,失败也 refresh 清锁
+              // (Copilot round 2 抓到的漏网调用点)。
+              const r = await runAction(
+                () => requestSeasonAction({ tmdbId, seasonNumber: onlySeason, storageId }),
+                (msg) => {
+                  setResult({ status: "unsupported", message: msg });
+                  router.refresh();
+                },
+              );
+              if (!r.ok) return;
+              setResult(r.value);
+              router.refresh();
+            });
           }}
         >
-          {isPending ? <LoaderCircle size={15} className="spin" aria-hidden /> : <Plus size={14} aria-hidden />}
-          {isPending ? "请求中" : isRemainingOfMany ? `获取第 ${onlySeason} 季` : "获取"}
+          {isPending ? <LoaderCircle size={14} className="spin" aria-hidden /> : <Plus size={14} aria-hidden />}
+          {isRemainingOfMany ? `获取第 ${onlySeason} 季` : "获取"}
         </button>
-        {manualButton(onlySeason)}
-        {resultMessage ? <p className="request-result">{resultMessage}</p> : null}
-      </div>
+        <AcquireResultNotice result={result} />
+      </>
     );
   }
 
   return (
-    <div className="season-action-group">
-      <div className="season-menu">
-        <button className="primary-button" type="button" disabled={isPending} onClick={() => autoSubmit()}>
-          {isPending ? <LoaderCircle size={15} className="spin" aria-hidden /> : <Plus size={14} aria-hidden />}
-          {isPending ? "请求中" : selected === "all" ? allLabel : `获取第 ${selected} 季`}
-        </button>
-        <button
-          className="season-menu-toggle"
-          type="button"
-          aria-label="选择获取范围"
-          aria-expanded={open}
-          disabled={isPending}
-          onClick={() => setOpen((value) => !value)}
-        >
-          <ChevronDown size={14} aria-hidden />
-        </button>
-        {open ? (
-          <ul className="season-menu-list" role="menu">
-            <li role="none">
+    <div className="season-menu">
+      <button className="primary-button" type="button" disabled={isPending} onClick={submit}>
+        {isPending ? <LoaderCircle size={14} className="spin" aria-hidden /> : <Plus size={14} aria-hidden />}
+        {selected === "all" ? allLabel : `获取第 ${selected} 季`}
+      </button>
+      <button
+        className="season-menu-toggle"
+        type="button"
+        aria-label="选择获取范围"
+        aria-expanded={open}
+        disabled={isPending}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <ChevronDown size={14} aria-hidden />
+      </button>
+      {open ? (
+        <ul className="season-menu-list" role="menu">
+          <li role="none">
+            <button
+              role="menuitemradio"
+              aria-checked={selected === "all"}
+              type="button"
+              onClick={() => {
+                setSelected("all");
+                setOpen(false);
+              }}
+            >
+              {selected === "all" ? <Check size={13} aria-hidden /> : <span className="menu-spacer" />}
+              {allLabel}
+            </button>
+          </li>
+          {seasonNumbers.map((seasonNumber) => (
+            <li key={seasonNumber} role="none">
               <button
                 role="menuitemradio"
-                aria-checked={selected === "all"}
+                aria-checked={selected === seasonNumber}
                 type="button"
                 onClick={() => {
-                  setSelected("all");
+                  setSelected(seasonNumber);
                   setOpen(false);
                 }}
               >
-                {selected === "all" ? <Check size={13} aria-hidden /> : <span className="menu-spacer" />}
-                {allLabel}
+                {selected === seasonNumber ? (
+                  <Check size={13} aria-hidden />
+                ) : (
+                  <span className="menu-spacer" />
+                )}
+                第 {seasonNumber} 季
               </button>
             </li>
-            {seasonNumbers.map((seasonNumber) => (
-              <li key={seasonNumber} role="none">
-                <button
-                  role="menuitemradio"
-                  aria-checked={selected === seasonNumber}
-                  type="button"
-                  onClick={() => {
-                    setSelected(seasonNumber);
-                    setOpen(false);
-                  }}
-                >
-                  {selected === seasonNumber ? <Check size={13} aria-hidden /> : <span className="menu-spacer" />}
-                  第 {seasonNumber} 季
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : null}
-      </div>
-      {manualButton()}
-      {resultMessage ? <p className="request-result">{resultMessage}</p> : null}
+          ))}
+        </ul>
+      ) : null}
+      <AcquireResultNotice result={result} />
     </div>
   );
 }

@@ -4,6 +4,7 @@ import { runMovieAcquisitionV2 } from "../src/movie-workflow-v2.js";
 import { FakeStorageExecutor } from "../src/fakes.js";
 import type { ResourceProvider } from "../src/ports.js";
 import type { MediaTitle, ResourceSnapshot } from "../src/domain.js";
+import type { JevJudge, JevJudgeInput } from "../src/jev-judge.js";
 
 const USAGE = {
   inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
@@ -122,7 +123,8 @@ describe("runMovieAcquisitionV2 — obtained comes from the AGENT'S coverage, ne
       storage: executor,
       model: scriptModel([
         { tool: "searchResources", input: { keyword: "盗梦空间" } },
-        { tool: "transferCandidate", input: { snapshotId: "snap_q", candidateId } },
+        // The agent addresses candidates by the short run-local alias it was shown.
+        { tool: "transferCandidate", input: { snapshotId: "s1", candidateId: "s1-1" } },
         { tool: "reportNoCoverage", input: { reason: "nothing landed" } },
       ]),
       workflowRunId: "run-blocked",
@@ -228,5 +230,146 @@ describe("runMovieAcquisitionV2 — obtained comes from the AGENT'S coverage, ne
     expect(executor.createdDirs).toEqual([
       { name: "盗梦空间 (2010) {tmdb-27205}", parentId: "movies_root" },
     ]);
+  });
+});
+
+
+describe("runMovieAcquisitionV2 forwards jevJudge to the orchestrator", () => {
+  it("the judge is invoked for the movie search, asked the MOVIE question", async () => {
+    // Threading test. The tv path has the same guard in v2-workflow.test.ts; the kind
+    // is what makes it worth its own case — a movie judged with the tv question would
+    // keep sequels and remakes (the movie rules are symmetric on year, tv's are not).
+    const seen: JevJudgeInput[] = [];
+    const jevJudge: JevJudge = { judgeCandidates: async (input) => { seen.push(input); return { scores: {}, model: "m" }; } };
+    const provider: ResourceProvider = {
+      search: async ({ keyword }): Promise<ResourceSnapshot> => ({
+        id: "snap_jev",
+        provider: "pansou",
+        keyword,
+        candidates: [
+          { id: "cand_jev", snapshotId: "snap_jev", index: 0, title: "盗梦空间 2010 1080p", type: "magnet", source: "pansou", providerPayload: { url: "magnet:?xt=urn:btih:abc" } },
+        ],
+        createdAt: "2026-06-14T00:00:00.000Z",
+      }),
+    };
+
+    await runMovieAcquisitionV2({
+      title,
+      resourceProvider: provider,
+      storage: new FakeStorageExecutor(),
+      model: scriptModel([
+        { tool: "searchResources", input: { keyword: "盗梦空间" } },
+        { tool: "reportNoCoverage", input: { reason: "threading test" } },
+      ]),
+      workflowRunId: "run-jev-movie",
+      moviesParentDirectoryId: "movies_root",
+      jevJudge,
+      now: () => "2026-06-14T00:00:00.000Z",
+    });
+
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen[0]!.target).toMatchObject({ kind: "movie", title: "盗梦空间", aliases: ["Inception"] });
+  });
+});
+
+describe("runMovieAcquisitionV2 forwards rejectedLookup to the orchestrator", () => {
+  it("an ordinary movie run reads the rejected list on search", async () => {
+    let reads = 0;
+    await runMovieAcquisitionV2({
+      title,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: scriptModel([
+        { tool: "searchResources", input: { keyword: "盗梦空间 Inception" } },
+        { tool: "reportNoCoverage", input: { reason: "threading test" } },
+      ]),
+      workflowRunId: "run-rejected-movie",
+      moviesParentDirectoryId: "movies_root",
+      rejectedLookup: {
+        list: async () => {
+          reads += 1;
+          return [];
+        },
+      },
+      now: () => "2026-06-14T00:00:00.000Z",
+    });
+    expect(reads).toBeGreaterThan(0);
+  });
+});
+
+describe("runMovieAcquisitionV2 — user request (replace_request run)", () => {
+  it("the old film stays obtained when it is not replaced; the request reaches the prompt and the tools", async () => {
+    const executor = new FakeStorageExecutor();
+    const movieDir = await executor.createDirectory({ name: "盗梦空间 (2010) {tmdb-27205}", parentId: "movies_root" });
+    executor.seedDirectoryFiles(movieDir, [
+      { id: "oldfilm", storageDirectoryId: movieDir, name: "Inception.2010.KnockOff.mkv", sizeBytes: 4_000_000_000, episodeCode: null, providerFileId: "oldfilm" },
+    ]);
+    let system = "";
+    let tools: string[] = [];
+    let calls = 0;
+    const tool = (name: string, input: unknown) => ({
+      content: [{ type: "tool-call" as const, toolCallId: `c${calls}`, toolName: name, input: JSON.stringify(input) }],
+      finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+      usage: USAGE,
+      warnings: [],
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        calls += 1;
+        if (calls === 1) {
+          system = JSON.stringify(options.prompt.find((m) => m.role === "system") ?? "");
+          tools = (options.tools ?? []).map((t) => t.name);
+          return tool("rejectCurrentSource", { rejections: [{ fileIds: ["oldfilm"] }], reason: "假片" });
+        }
+        if (calls === 2) return tool("reportReplacement", { results: [{ episode: "MOVIE", outcome: "not_found", note: "没有正版" }] });
+        return { content: [{ type: "text" as const, text: "done" }], finishReason: { unified: "stop" as const, raw: "stop" as const }, usage: USAGE, warnings: [] };
+      },
+    });
+
+    const result = await runMovieAcquisitionV2({
+      title,
+      resourceProvider: emptyProvider(),
+      storage: executor,
+      model,
+      workflowRunId: "run-m-ur",
+      moviesParentDirectoryId: "movies_root",
+      userRequest: {
+        requestedEpisodes: ["MOVIE"],
+        prompt: { messages: [{ body: "这是假片", episodeTags: ["MOVIE"], createdAt: "2026-09-26T08:00:00.000Z" }], rejected: [], pending: [] },
+        rejectedStore: { list: async () => [], add: async () => undefined },
+      },
+      // The film was obtained before this run (the knock-off is in the library).
+      priorObtained: true,
+      now: () => "2026-09-26T08:00:00.000Z",
+    });
+
+    expect(system).toContain("USER REQUESTS");
+    expect(system).toContain("这是假片");
+    expect(tools).toEqual(expect.arrayContaining(["rejectCurrentSource", "reportReplacement"]));
+    expect(result.episodes[0]!.obtained).toBe(true);
+    expect(result.replacement).toEqual({
+      results: [{ episode: "MOVIE", outcome: "not_found", note: "没有正版" }],
+      rejected: [expect.objectContaining({ episode: "MOVIE", label: "Inception.2010.KnockOff.mkv" })],
+      oldFiles: ["Inception.2010.KnockOff.mkv"],
+      identified: true,
+    });
+    expect((await executor.listTree({ directoryId: movieDir })).map((f) => f.providerFileId)).toContain("oldfilm");
+  });
+
+  it("no user request → no replacement on the result", async () => {
+    const result = await runMovieAcquisitionV2({
+      title,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: scriptModel([
+        { tool: "searchResources", input: { keyword: "盗梦空间" } },
+        { tool: "reportNoCoverage", input: { reason: "no candidates" } },
+      ]),
+      workflowRunId: "run-m-plain",
+      moviesParentDirectoryId: "movies_root",
+      now: () => "2026-09-26T08:00:00.000Z",
+    });
+    expect(result.replacement).toBeUndefined();
+    expect(result.episodes[0]!.obtained).toBe(false);
   });
 });

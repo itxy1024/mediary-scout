@@ -1,6 +1,6 @@
 #!/bin/sh
-# Reliable, SELF-VERIFYING self-host redeploy: pull the latest repository state and
-# published web image, restart the stack, then prove they point to the same commit.
+# Reliable, SELF-VERIFYING self-host redeploy: pull latest, rebuild web, restart the
+# stack, then PROVE the running container actually serves the pulled commit.
 #
 # Why this exists (2026-07-04 #88–#98): five deploys in a row silently kept serving OLD
 # code — the box ran a stale image for a whole day before anyone noticed. The failure
@@ -11,6 +11,10 @@
 # container's stamped commit (BUILD_COMMIT) against HEAD and exits non-zero on mismatch,
 # which catches a stale build, a no-op `git pull`, or a container that wasn't recreated.
 #
+# It also does NOT use `--no-cache` (that throws away the cached `npm ci`, ~minutes):
+# GIT_SHA=$(git rev-parse HEAD) is passed as a build arg the Dockerfile uses right before
+# `COPY . .`, forcing a fresh source COPY + build per commit while deps stay cached.
+#
 # Usage (on the host, in the repo dir):   ./scripts/deploy.sh [extra `up` args]
 set -eu
 
@@ -18,12 +22,40 @@ set -eu
 # portability across /bin/sh implementations (busybox ash, dash, bash).
 cd "$(dirname "$0")/.."
 
+# Take the same repository lock the updater's run-update.sh takes, so a one-click update and
+# this manual deploy never build/checkout/swap the same repo and compose project at once. The
+# lock is a git/docker-ignored file at the repo root; the updater sees the same inode through
+# its bind mount, and flock is an inode-level advisory lock the kernel shares across the two.
+# The updater only holds it during a normal update, not during its own recovery, so a deploy
+# meant to fix a broken state is never blocked. Held via fd 9 for this whole script.
+# flock is on Linux hosts (util-linux) and the updater's Alpine image; absent on macOS, where
+# `command -v flock` skips it (the deployment box is Linux). Non-blocking: refuse, don't hang.
+if command -v flock >/dev/null 2>&1; then
+  LOCK=".update.lock"
+  [ -e "$LOCK" ] || (umask 000; : > "$LOCK") 2>/dev/null || true
+  exec 9>>"$LOCK"
+  if ! flock -n 9; then
+    echo "==> 一键更新正在进行，请等它结束后再运行本脚本（或在设置→更新里查看进度）。"
+    exit 1
+  fi
+fi
+
+# The updater leaves the deploy folder on a release tag; pull needs a branch.
+git symbolic-ref -q HEAD >/dev/null || git checkout main
+
 echo "==> git pull --ff-only"
 git pull --ff-only
 
-EXPECTED_SHA="$(git rev-parse HEAD)"
-echo "==> Pulling published web image for commit ${EXPECTED_SHA}"
-docker compose pull web
+GIT_SHA="$(git rev-parse HEAD)"
+export GIT_SHA
+echo "==> Building web at commit ${GIT_SHA}"
+# compose reads build.args GIT_SHA=${GIT_SHA} from the exported env above — no need to
+# pass --build-arg. No --no-cache either: the GIT_SHA cache-bust already forces the
+# source COPY + build to re-run, while keeping the (slow) npm ci layer cached.
+# Build the updater too: `docker compose up -d` never rebuilds an existing image, and
+# one-click updates only replace web (the updater can't swap its own container) — a
+# manual deploy is the only way the updater itself gets new code.
+docker compose build web updater
 
 echo "==> Starting stack"
 docker compose up -d "$@"
@@ -41,10 +73,10 @@ while [ "$i" -lt 15 ]; do
   i=$((i + 1))
   sleep 1
 done
-[ -n "$RUNNING" ] || RUNNING='<no BUILD_COMMIT — image predates this check; pull again>'
-echo "    expected (HEAD):        ${EXPECTED_SHA}"
+[ -n "$RUNNING" ] || RUNNING='<no BUILD_COMMIT — image predates this fix; rebuild once more>'
+echo "    expected (HEAD):        ${GIT_SHA}"
 echo "    running container:      ${RUNNING}"
-if [ "${RUNNING}" = "${EXPECTED_SHA}" ]; then
+if [ "${RUNNING}" = "${GIT_SHA}" ]; then
   echo "==> Verifying application readiness"
   i=0
   READY=0
@@ -64,7 +96,7 @@ if [ "${RUNNING}" = "${EXPECTED_SHA}" ]; then
     exit 1
   fi
 else
-  echo "==> WARNING: running container commit != HEAD. The latest published image may"
-  echo "    still be building, or the container did not recreate. Retry after CI finishes."
+  echo "==> WARNING: running container commit != HEAD. The build may have been cached"
+  echo "    stale, or the container did not recreate. Investigate before trusting it."
   exit 1
 fi

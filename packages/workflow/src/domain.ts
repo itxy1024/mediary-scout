@@ -8,12 +8,40 @@ import type { MergedSourceHealth } from "./resource-source-health.js";
  */
 export const DEFAULT_ACCOUNT_ID = "acct_default";
 
+/** Hides rows the previous janitor wrote (`staging-janitor:<storageId>` inbox runs). */
+export function isStagingJanitorId(id: string): boolean {
+  return id.startsWith("staging-janitor");
+}
+
 export type MediaType = "movie" | "tv" | "anime";
 export type SeasonStatus = "active" | "completed";
 export type LatestAiredSource = "metadata" | "manual" | "unknown";
 export type AirStatus = "aired" | "unaired" | "unknown";
 export type MetadataStatus = "confirmed" | "provider_ahead" | "storage_only";
-export type WorkflowKind = "type1_package_init" | "type2_init" | "type3_monitor" | "movie_init";
+/** `replace_request` = a user message asking the agent to swap a bad resource
+ *  (packages/workflow/src/replace-request.ts); it covers every tracked season. */
+/** `staging_recovery` = a silent janitor run that judges one leftover staging dir.
+ *  Users never see it (no notification, no activity row). */
+export type WorkflowKind =
+  | "type1_package_init"
+  | "type2_init"
+  | "type3_monitor"
+  | "movie_init"
+  | "replace_request"
+  | "staging_recovery";
+
+/** Runs of this kind stay off every user-facing list (activity, library, show page). */
+export function isUserVisibleWorkflowKind(kind: WorkflowKind): boolean {
+  return kind !== "staging_recovery";
+}
+
+/** Notice kinds a user must never see. Applied inside the notification queries,
+ *  before the limit, so a leftover row cannot crowd out a real one. */
+export const HIDDEN_NOTIFICATION_KINDS = ["staging_leftover", "staging_recovery"] as const;
+
+export function isUserVisibleNotificationKind(kind: string): boolean {
+  return !(HIDDEN_NOTIFICATION_KINDS as readonly string[]).includes(kind);
+}
 export type WorkflowStatus =
   | "queued"
   | "running"
@@ -25,7 +53,7 @@ export type WorkflowStatus =
    *  releases, but NOT queued/running — the worker never claims it and it is not an
    *  "active" run (see isActiveWorkflowStatus). The air-time gate runs the agent. */
   | "reserved";
-export type ResourceType = "115" | "magnet" | "manual" | "quark" | "tianyi" | "123";
+export type ResourceType = "115" | "magnet" | "manual" | "quark" | "uc" | "tianyi" | "123" | "guangya";
 export type TransferStatus = "succeeded" | "failed" | "no_target_change";
 export type Confidence = "low" | "medium" | "high";
 
@@ -137,6 +165,42 @@ export interface ResourceSnapshot {
   /** 本次搜索各源的健康态。可选：老快照与不关心健康态的 provider 不带此字段。
    *  缺失时按 healthy 处理（向后兼容），因此新增判定必须显式检查而非假设存在。 */
   sourceHealth?: MergedSourceHealth;
+  /** Optional pre-agent filter trace (see SnapshotPrefilter). Absent when no filter ran. */
+  prefilter?: SnapshotPrefilter;
+}
+
+/** Result of an optional pre-agent candidate filter (today: Jev). Rides the jsonb
+ *  snapshot payload so dropped candidates stay auditable and future evals can be
+ *  replayed from production data. `skipped` = fail-open (nothing was dropped). */
+export interface SnapshotPrefilter {
+  provider: "jev";
+  model: string;
+  /** applied = filtered; skipped = not attempted (nothing judgeable); failed = attempted and errored → fail-open, nothing dropped. */
+  status: "applied" | "skipped" | "failed";
+  /** Why the filter was not applied: skipped (nothing judgeable) or failed (judge
+   *  error/timeout/circuit-open). Never contains secrets. */
+  reason?: string;
+  /** candidateId → P(refers to target) for every judged candidate, dropped ones included. */
+  scores: Record<string, number>;
+  dropped: Array<{ id: string; title: string; score: number }>;
+  /** Candidates the judge scored below dropBelow but that were KEPT because their title
+   *  contains the target title/alias verbatim (structural floor — the one unacceptable
+   *  failure is dropping the right pack). Only present when non-empty. */
+  floored?: Array<{ id: string; title: string; score: number }>;
+  thresholds: { dropBelow: number; uncertainBelow: number };
+  durationMs: number;
+  inputTokens?: number;
+  cost?: number;
+  /** Chunks the judge could not answer (their candidates were kept unjudged). Only
+   *  present when > 0; status stays "applied". */
+  failedChunks?: number;
+  /** candidateId → P(adult content) for every judged candidate. Only present when the
+   *  judge answered the nsfw question. */
+  nsfw?: Record<string, number>;
+  /** Candidates removed as adult content (see isNsfwDrop) — a separate bucket from
+   *  `dropped` (identity) so an audit can tell "wrong work" from "porn". `score` is the
+   *  nsfw probability. Wins over the containment floor. Only present when non-empty. */
+  nsfwDropped?: Array<{ id: string; title: string; score: number }>;
 }
 
 export interface AgentDecision {
@@ -202,6 +266,18 @@ export interface TransferAttempt {
   status: TransferStatus;
   providerMessage: string;
   materializedFileIds: string[];
+  /**
+   * What became of the files this transfer materialized, counted at the end of
+   * its run: kept = moved into a target dir (or landed in the movie dir) and
+   * still there; thrownAway = deleted, discarded with staging, or left in
+   * staging. Absent = not recorded (older runs, or nothing materialized).
+   */
+  fate?: { kept: number; thrownAway: number };
+  /** The names those files actually landed under, parallel to materializedFileIds —
+   *  set only by an executor that knows them and whose landing name can differ from
+   *  the requested one (123 lands a taken name as `name(1).ext`). Absent = the
+   *  requested name. */
+  materializedNames?: string[];
 }
 
 export interface VerifiedFile {
@@ -233,7 +309,8 @@ export type NotificationReportStatus =
   | "partial" // a genuine aired gap remains
   | "no_coverage" // nothing found yet
   | "failed" // acquisition failed terminally (transient retries exhausted, or a hard error)
-  | "retrying"; // transient failure; an automatic retry is scheduled
+  | "retrying" // transient failure; an automatic retry is scheduled
+  | "replaced"; // a user-requested replacement landed (the old file stays beside it)
 
 /**
  * Structured acquisition report. The single source of wording: the web feed
@@ -264,6 +341,10 @@ export interface NotificationReport {
   fileCount?: number;
   totalBytes?: number;
   landingDir?: string;
+  /** Short drive labels where files landed during this run (e.g. ["115"] or ["115", "123"]). */
+  driveLabels?: string[];
+  /** Standing selection preference text that was active when the agent searched/picked for this run. */
+  selectionPreference?: string;
 }
 
 export interface NotificationEvent {
@@ -276,6 +357,8 @@ export interface NotificationEvent {
   /** Absent on legacy/foreign-work events; generators set it going forward. */
   trigger?: NotificationTrigger;
   report?: NotificationReport;
+  /** Connected storage ID of the workflow run that generated this notification (populated on read). */
+  connectedStorageId?: string | null;
 }
 
 export function episodeCode(seasonNumber: number, episodeNumber: number): string {
@@ -451,3 +534,282 @@ export interface MovieWorkflowResult {
   notifications: NotificationEvent[];
   auditEvents: AuditEvent[];
 }
+
+export interface DriveSpaceCacheEntry {
+  storageId: string;
+  totalBytes: number;
+  usedBytes: number;
+  probedAt: string;
+}
+
+/** One physical copy of an episode on a specific connected drive (`episode_copies`). */
+export interface EpisodeCopy {
+  trackedSeasonId: string;
+  episodeCode: string;
+  storageId: string;
+  fileIds: string[];
+  sizeBytes: number | null;
+  quality: string | null;
+  runId: string;
+  recordedAt: string;
+}
+
+/** Cross-drive union summary for one episode of a tracked season (C9). */
+export interface CrossDriveEpisodeOwnership {
+  episodeCode: string;
+  obtained: boolean;
+  metadataStatus: MetadataStatus;
+  drives: Array<{
+    storageId: string;
+    fileIds: string[];
+    sizeBytes: number | null;
+    quality: string | null;
+  }>;
+}
+
+/** 30-minute TTL for cached drive space numbers (`drive_space_cache`). */
+export const DRIVE_SPACE_CACHE_TTL_MS = 30 * 60 * 1000;
+
+/** Account-setting key storing the user's preferred drive order (JSON `string[]` of storageIds). */
+export const DRIVE_ORDER_SETTING_KEY = "drive_order";
+
+/** Order a list of drives by a user-configured `drive_order` array. Any drive not
+ *  named in `order` keeps its relative `createdAt` (connection-order) position after
+ *  the ordered ones. Pure & deterministic. */
+export function sortDrivesByOrder<T extends { id: string; createdAt?: string }>(
+  drives: readonly T[],
+  order: readonly string[] | null | undefined,
+): T[] {
+  const rank = new Map<string, number>();
+  order?.forEach((id, idx) => {
+    if (typeof id === "string" && id && !rank.has(id)) {
+      rank.set(id, idx);
+    }
+  });
+  return [...drives].sort((a, b) => {
+    const rA = rank.get(a.id);
+    const rB = rank.get(b.id);
+    if (rA !== undefined && rB !== undefined) return rA - rB;
+    if (rA !== undefined) return -1;
+    if (rB !== undefined) return 1;
+    if (a.createdAt && b.createdAt && a.createdAt !== b.createdAt) {
+      return a.createdAt.localeCompare(b.createdAt);
+    }
+    return 0;
+  });
+}
+
+/** Format drive space into a concise human-readable Chinese string for settings cards
+ *  and agent context. Negative remaining bytes (over-quota) are preserved explicitly,
+ *  never clamped to zero. */
+export function formatDriveSpaceSummary(
+  space: { totalBytes: number; usedBytes: number } | null | undefined,
+): {
+  remainingBytes: number | null;
+  overQuota: boolean;
+  badgeText: string;
+  agentText: string;
+} {
+  if (!space || !Number.isFinite(space.totalBytes) || !Number.isFinite(space.usedBytes) || space.totalBytes <= 0) {
+    return {
+      remainingBytes: null,
+      overQuota: false,
+      badgeText: "容量未知",
+      agentText: "容量未知",
+    };
+  }
+  const remainingBytes = space.totalBytes - space.usedBytes;
+  const overQuota = remainingBytes <= 0;
+  if (overQuota) {
+    const exceededLabel = formatByteSize(Math.abs(remainingBytes));
+    return {
+      remainingBytes,
+      overQuota: true,
+      badgeText: remainingBytes < 0
+        ? `已超额 ${exceededLabel}（共 ${formatByteSize(space.totalBytes)}）`
+        : `空间已满（共 ${formatByteSize(space.totalBytes)}）`,
+      agentText: remainingBytes < 0
+        ? `已超配额 ${exceededLabel}（总额 ${formatByteSize(space.totalBytes)}，已用 ${formatByteSize(space.usedBytes)}）— 禁止写入`
+        : `剩余 0 B（已满）— 禁止写入`,
+    };
+  }
+  return {
+    remainingBytes,
+    overQuota: false,
+    badgeText: `剩余 ${formatByteSize(remainingBytes)} / ${formatByteSize(space.totalBytes)}`,
+    agentText: `剩余 ${formatByteSize(remainingBytes)}（总额 ${formatByteSize(space.totalBytes)}）`,
+  };
+}
+
+/** Strict finite number coercion for JSON API responses: accepts only finite
+ *  numbers or non-empty numeric strings (rejects null, booleans, "", whitespace). */
+export function parseFiniteMetric(value: unknown): number {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : Number.NaN;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  }
+  return Number.NaN;
+}
+
+export function formatByteSize(bytes: number): string {
+  const abs = Math.abs(bytes);
+  const sign = bytes < 0 ? "-" : "";
+  const TB = 1024 ** 4;
+  const GB = 1024 ** 3;
+  const MB = 1024 ** 2;
+  if (abs >= TB) {
+    return `${sign}${(abs / TB).toFixed(2)} TB`;
+  }
+  if (abs >= GB) {
+    return `${sign}${(abs / GB).toFixed(1)} GB`;
+  }
+  if (abs >= MB) {
+    return `${sign}${(abs / MB).toFixed(1)} MB`;
+  }
+  return `${sign}${Math.round(abs)} B`;
+}
+
+/** Compare episode codes numerically by (season, episode) when possible,
+ *  falling back to lexicographic comparison for non-standard codes. */
+export function compareEpisodeCodes(a: string, b: string): number {
+  const mA = /^S(\d+)E(\d+)$/.exec(a);
+  const mB = /^S(\d+)E(\d+)$/.exec(b);
+  if (mA && mB) {
+    const sDiff = Number(mA[1]) - Number(mB[1]);
+    if (sDiff !== 0) return sDiff;
+    return Number(mA[2]) - Number(mB[2]);
+  }
+  return a.localeCompare(b);
+}
+
+/** Build the cross-drive union of episode ownership from per-drive episode_states
+ *  buckets and `episode_copies` rows.
+ *  - `episode_states` is authoritative for drives that have a tracked bucket for
+ *    this season under the account: an episode is obtained on that drive iff
+ *    `ep.obtained === true`.
+ *  - `episode_copies` provides `fileIds`, `sizeBytes`, and `quality` for those
+ *    obtained episodes, and also contributes obtained episodes on drives owned by
+ *    the account that do not have a separate `episode_states` bucket (unless the
+ *    season was untracked across all buckets). */
+export function buildCrossDriveEpisodeOwnership(input: {
+  driveEpisodeBuckets: ReadonlyArray<{
+    storageId: string;
+    episodes: readonly EpisodeState[];
+  }>;
+  copies: readonly EpisodeCopy[];
+  ownedStorageIds?: ReadonlySet<string>;
+  unscopedStorageSentinel?: string;
+}): CrossDriveEpisodeOwnership[] {
+  const unscoped = input.unscopedStorageSentinel ?? "";
+  const copyByEpisodeAndDrive = new Map<string, EpisodeCopy>();
+  for (const c of input.copies) {
+    copyByEpisodeAndDrive.set(`${c.episodeCode}::${c.storageId}`, c);
+  }
+  const latestRecordedAtByDrive = new Map<string, string>();
+  for (const c of input.copies) {
+    if (!c.recordedAt) continue;
+    const prev = latestRecordedAtByDrive.get(c.storageId);
+    if (!prev || c.recordedAt > prev) {
+      latestRecordedAtByDrive.set(c.storageId, c.recordedAt);
+    }
+  }
+
+  const byEpisode = new Map<string, CrossDriveEpisodeOwnership>();
+  const bucketsSeen = new Set<string>();
+
+  for (const bucket of input.driveEpisodeBuckets) {
+    bucketsSeen.add(bucket.storageId);
+    for (const ep of bucket.episodes) {
+      let entry = byEpisode.get(ep.episodeCode);
+      if (!entry) {
+        entry = {
+          episodeCode: ep.episodeCode,
+          obtained: false,
+          metadataStatus: ep.metadataStatus,
+          drives: [],
+        };
+        byEpisode.set(ep.episodeCode, entry);
+      }
+      if (ep.obtained) {
+        entry.obtained = true;
+        if (ep.metadataStatus === "provider_ahead") {
+          entry.metadataStatus = "provider_ahead";
+        }
+        if (bucket.storageId && bucket.storageId !== unscoped) {
+          const copy = copyByEpisodeAndDrive.get(`${ep.episodeCode}::${bucket.storageId}`);
+          if (!entry.drives.some((d) => d.storageId === bucket.storageId)) {
+            entry.drives.push({
+              storageId: bucket.storageId,
+              fileIds: copy && copy.fileIds.length > 0 ? [...copy.fileIds] : [...ep.verifiedFileIds],
+              sizeBytes: copy?.sizeBytes ?? null,
+              quality: copy?.quality ?? null,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Only fold in episode_copies from drives that do NOT have an authoritative
+  // episode_states bucket (or when no bucket listed that drive) AND belong to
+  // the account, provided the season has at least one tracked bucket for the account.
+  if (input.driveEpisodeBuckets.length > 0) {
+    for (const c of input.copies) {
+      if (input.ownedStorageIds && !input.ownedStorageIds.has(c.storageId)) {
+        continue;
+      }
+      if (bucketsSeen.has(c.storageId)) {
+        // Authoritative bucket already processed above: if ep.obtained was false
+        // in that drive's episode_states, do NOT resurrect it from episode_copies.
+        continue;
+      }
+      let entry = byEpisode.get(c.episodeCode);
+      if (!entry) {
+        entry = {
+          episodeCode: c.episodeCode,
+          obtained: true,
+          metadataStatus: "confirmed",
+          drives: [],
+        };
+        byEpisode.set(c.episodeCode, entry);
+      } else {
+        entry.obtained = true;
+      }
+      if (!entry.drives.some((d) => d.storageId === c.storageId)) {
+        entry.drives.push({
+          storageId: c.storageId,
+          fileIds: [...c.fileIds],
+          sizeBytes: c.sizeBytes,
+          quality: c.quality,
+        });
+      }
+    }
+  }
+
+  return [...byEpisode.values()]
+    .map((entry) => {
+      if (entry.drives.length <= 1 || latestRecordedAtByDrive.size === 0) {
+        return entry;
+      }
+      const sortedDrives = [...entry.drives].sort((a, b) => {
+        const recA =
+          copyByEpisodeAndDrive.get(`${entry.episodeCode}::${a.storageId}`)?.recordedAt ??
+          (byEpisode.size === 1 ? latestRecordedAtByDrive.get(a.storageId) : undefined) ??
+          "";
+        const recB =
+          copyByEpisodeAndDrive.get(`${entry.episodeCode}::${b.storageId}`)?.recordedAt ??
+          (byEpisode.size === 1 ? latestRecordedAtByDrive.get(b.storageId) : undefined) ??
+          "";
+        if (recA !== recB) {
+          return recB.localeCompare(recA);
+        }
+        return 0;
+      });
+      return { ...entry, drives: sortedDrives };
+    })
+    .sort((a, b) => compareEpisodeCodes(a.episodeCode, b.episodeCode));
+}
+

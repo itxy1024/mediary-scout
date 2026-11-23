@@ -16,6 +16,7 @@ import {
   hasSuccessfulNoCoverageReport,
   reflectionSystemOverride,
   toStepSignature,
+  PAN115_TRANSFER_RESERVE_CALLS,
 } from "../src/index.js";
 
 describe("toStepSignature", () => {
@@ -167,6 +168,11 @@ describe("budgetReflectionNudge (115 call-budget soft warning)", () => {
     expect(BUDGET_REMINDER).toContain("flattenMovie"); // movie path explicitly covered
     expect(BUDGET_REMINDER).toMatch(/电影.*不要再?\s*discardStaging|电影.*flattenMovie/);
   });
+
+  it("reminder tells the agent transfers get refused mechanically inside the reserve (so a refusal reads as 'wrap up', not 'retry')", () => {
+    expect(BUDGET_REMINDER).toMatch(/保留额/);
+    expect(BUDGET_REMINDER).toContain("transferSubtitle");
+  });
 });
 
 describe("budgetSoftThreshold (derive soft from configured hard)", () => {
@@ -178,6 +184,13 @@ describe("budgetSoftThreshold (derive soft from configured hard)", () => {
   });
   it("clamps to ≥1 for a tiny budget (never negative)", () => {
     expect(budgetSoftThreshold(10)).toBe(1);
+  });
+
+  it("soft nudge fires BELOW the mechanical transfer stop, which sits BELOW the hard limit (240 < 260 < 300)", () => {
+    const hard = 300;
+    const transferStop = hard - PAN115_TRANSFER_RESERVE_CALLS;
+    expect(budgetSoftThreshold(hard)).toBeLessThan(transferStop);
+    expect(transferStop).toBeLessThan(hard);
   });
 });
 
@@ -202,6 +215,39 @@ describe("prepareStepSystemOverride (composes step-cap + budget nudges)", () => 
   it("neither → undefined (no override)", () => {
     expect(prepareStepSystemOverride({ stepNumber: 5, maxSteps: 60, baseSystem: base, apiCallsSpent: 10 })).toBeUndefined();
     expect(prepareStepSystemOverride({ stepNumber: 5, maxSteps: 60, baseSystem: base })).toBeUndefined();
+  });
+  it("a recovery near the cap or over budget gets only the recovery reminder", () => {
+    const reminder =
+      "【进度提醒】这次整理快到上限了。请:① 已确认是季目录缺的视频,moveToSeason 入季并 markObtained;② 还没判断清楚的文件不要删,也不要 discardStaging——留着,下次会再整理;③ finish。";
+    const nearCap = prepareStepSystemOverride({
+      stepNumber: 55,
+      maxSteps: 60,
+      baseSystem: base,
+      apiCallsSpent: 10,
+      stagingRecovery: true,
+    })!;
+    const overBudget = prepareStepSystemOverride({
+      stepNumber: 5,
+      maxSteps: 60,
+      baseSystem: base,
+      apiCallsSpent: 260,
+      stagingRecovery: true,
+    })!;
+    expect(nearCap).toBe(`${base}\n\n${reminder}`);
+    expect(overBudget).toBe(`${base}\n\n${reminder}`);
+    expect(nearCap).not.toContain("discardStaging 清空");
+    expect(overBudget).not.toContain(STEP_50_REMINDER);
+    expect(overBudget).not.toContain(BUDGET_REMINDER);
+    expect(prepareStepSystemOverride({
+      stepNumber: 5,
+      maxSteps: 60,
+      baseSystem: base,
+      apiCallsSpent: 10,
+      stagingRecovery: true,
+    })).toBeUndefined();
+    const ordinary = prepareStepSystemOverride({ stepNumber: 55, maxSteps: 60, baseSystem: base, apiCallsSpent: 260 })!;
+    expect(ordinary).toContain(STEP_50_REMINDER);
+    expect(ordinary).toContain(BUDGET_REMINDER);
   });
 });
 

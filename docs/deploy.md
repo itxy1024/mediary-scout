@@ -2,14 +2,14 @@
 
 Mediary Scout 有两种部署方式:
 
-| | macOS 桌面版 | Docker Compose (服务器) |
+| | 桌面版(macOS / Windows) | Docker Compose (服务器) |
 |---|---|---|
-| 适合 | Mac 用户,不想折腾 Docker | NAS / 软路由 / VPS / 闲置 PC |
+| 适合 | 自己用,不想折腾 Docker | NAS / 软路由 / VPS / 闲置 PC |
 | 数据层 | SQLite(本地文件) | Postgres |
-| 部署 | 下载 DMG,拖进 Applications | `docker compose up -d` |
+| 部署 | 下载 DMG / EXE 安装 | `docker compose up -d` |
 | 下载 | [GitHub Releases](https://github.com/fancydirty/mediary-scout/releases) | 本指南下方 |
 
-**桌面版**:去 [Releases](https://github.com/fancydirty/mediary-scout/releases) 下载 `.dmg` 或 `.exe`,打开安装,启动后在 Settings 里配网盘和 LLM 即可。详见 [README → Install](../README.md#install)。
+**桌面版**:去 [Releases](https://github.com/fancydirty/mediary-scout/releases) 下载 `.dmg` 或 `.exe`,打开安装,启动后在设置里配网盘和 AI 模型即可,有新版本时应用会提示你下载。详见 [README → 安装](../README.md#安装)。
 
 **Docker 版**:继续往下看。
 
@@ -20,6 +20,7 @@ Mediary Scout 有两种部署方式:
 一行命令起整套:**web(Next + 进程内 worker)+ Postgres + 自带 PanSou**。本指南覆盖:选宿主 → compose 起服务 → 从自己的设备访问 → 安全/升级。
 
 ## 目录
+- [让 AI agent 帮你部署](#让-ai-agent-帮你部署)
 - [选择你的宿主](#选择你的宿主)
 - [Compose 快速开始](#compose-快速开始)
 - [光鸭云盘(GuangYaPan)连接](#光鸭云盘guangyapan连接)
@@ -29,8 +30,45 @@ Mediary Scout 有两种部署方式:
 - [可选增强](#可选增强)
 - [从你的设备访问](#从你的设备访问)
 - [安全](#安全)
-- [国内构建加速](#国内构建加速连不上-docker-hub)
+- [多用户与忘记密码](#多用户与忘记密码)
+- [国内构建加速](#国内构建加速docker-hub-常年不稳定)
 - [升级](#升级)
+- [备份与恢复](#备份与恢复pgdata)
+
+## 让 AI agent 帮你部署
+
+想让 AI agent(Claude Code、Codex、opencode 等)带你部署,把下面这段提示词丢给它,它会先问清楚再替你执行:
+
+````markdown
+你要部署 Mediary Scout(巡影),一个自部署的媒体获取 agent。按仓库 docs/deploy.md 来。按下面顺序问用户,然后执行。
+
+## 必问(没答案别开始)
+1. **部署到哪台机器?** NAS / 软路由 / 闲置 PC / VPS,以及我怎么操作它——SSH 进去,还是在它本机终端跑命令?
+2. **单账号还是多账号?** 默认单账号(就你自己用)。多账号让家人/朋友各注册、各绑自己的网盘、各看各的库。
+
+## 建议问(有默认,但确认偏好)
+3. **只在局域网用,还是出门也要用?**
+   - 只在局域网(默认——同一 WiFi 下的设备打开 `http://<主机IP>:3000`)
+   - Tailscale(私有 mesh——家用推荐,无需公网 IP、自动加密)
+   - Cloudflare Tunnel(公网 HTTPS 如 `https://media.yourdomain.com`——需要托管在 Cloudflare 的域名 + Access 前置鉴权)
+4. **现在就配真实获取,还是先起来看看?** 真实获取需要一块支持的网盘(夸克 / UC / 115 / 光鸭 / 123 / 天翼)+ 一个 OpenAI 兼容的 AI 模型接口。先不配也能起来看界面,之后在设置页配。
+
+## 可选——一句话问,都不需要就跳过
+5. 这些可选项有想现在配的吗?都不需要就回「跳过」:
+   - 通知推送(Bark / Server酱 / 企业微信 / webhook)
+   - 自己的 TMDB key(不配默认走作者代理,开箱即用)
+   - Prowlarr 磁力聚合(115 / 光鸭 / 123 可用)
+   - 国内构建加速(registry mirror + npm 镜像)
+
+## 然后执行
+- `git clone https://github.com/fancydirty/mediary-scout && cd mediary-scout`
+- 国内构建加速(首次 `up` **之前**):按本文「国内构建加速」一节配镜像加速——Linux(软路由 / NAS 上直接装的 Docker)改 `/etc/docker/daemon.json`,Docker Desktop(macOS / Windows)在它自己的设置里改;npm 镜像用 `docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com`
+- `docker compose up -d`(首次构建要几分钟)
+- 多账号:在 `.env` 加 `MEDIA_TRACK_MULTI_USER=1`,再 `docker compose up -d web`
+- Cloudflare Tunnel:按本文「方式二」——在 Zero Trust 控制台建隧道,把 token 写进 `.env` 的 `TUNNEL_TOKEN=<你的-token>`,`docker compose --profile tunnel up -d`,并**务必加 Cloudflare Access**(别裸挂公网)
+- 打开 `http://<主机>:3000`,带用户走设置页(网盘 / AI 模型 / 可选项)
+- 确认跑起来,报出网址,并告诉用户:以后在「设置 → 更新」里一键更新(也可以打开每天自动更新);命令行升级用 `./scripts/deploy.sh`
+````
 
 ## 选择你的宿主
 
@@ -47,13 +85,13 @@ Mediary Scout 有两种部署方式:
 
 ```bash
 git clone https://github.com/fancydirty/mediary-scout && cd mediary-scout
-docker compose up -d        # 首次会拉取 web 成品镜像和依赖服务
+docker compose up -d        # 首次会构建 web 镜像,几分钟
 ```
 
 > ### ⚠️ 墙内先看这个:Docker Hub 大概率拉不动
 >
-> Compose 会从 Docker Hub 拉取 `postgres` 和 `cloudflared`,从 GHCR 拉取 `web` 和
-> `pansou`,而 **Docker Hub 在中国大陆常年不稳定**。典型报错:
+> 本项目有三个镜像来自 Docker Hub(`postgres`、构建 web 用的 `node`、`cloudflared`),
+> 而 **Docker Hub 在中国大陆常年不稳定**。典型报错:
 >
 > ```
 > failed to fetch anonymous token: Get "https://auth.docker.io/token...": EOF
@@ -61,15 +99,15 @@ docker compose up -d        # 首次会拉取 web 成品镜像和依赖服务
 > read: connection reset by peer
 > ```
 >
-> **这不是你配置错了,重试也没用**。请给 Docker daemon 配置 `registry-mirrors`,
-> 重启 Docker 后再启动 Compose。Docker Desktop 在 **Settings → Docker Engine** 中修改;
-> Linux / NAS 修改 `/etc/docker/daemon.json`。示例:
+> **这不是你配置错了,重试也没用**(作者实测重试十余次全失败)。在仓库根 `.env` 里
+> 加一行镜像源,三处会一起生效:
 >
-> ```json
-> { "registry-mirrors": ["https://docker.1ms.run"] }
+> ```bash
+> echo 'DOCKER_MIRROR=docker.1ms.run' >> .env
+> docker compose up -d
 > ```
 >
-> 已实测可用的候选镜像源(2026-08-01,大陆直连):
+> 已实测可用(2026-08-01,大陆直连,四个都能拉到全部三个镜像):
 >
 > | 镜像源 | 备注 |
 > |---|---|
@@ -78,17 +116,20 @@ docker compose up -d        # 首次会拉取 web 成品镜像和依赖服务
 > | `docker.m.daocloud.io` | |
 > | `hub.rat.dev` | |
 >
-> **公共镜像站会轮流失效 —— 一个不通就换下一个,别只记住一个。** 配置后重新运行:
+> **公共镜像站会轮流失效 —— 一个不通就换下一个,别只记住一个。** 验证某站可用:
 >
 > ```bash
-> docker compose up -d
+> docker pull docker.1ms.run/library/node:22-slim
 > ```
 >
-> `.env` 中的 `DOCKER_MIRROR` 只供手动源码构建时作为 `--build-arg` 使用,
-> 不会改写当前 Compose 的 `image` 地址。境外网络通常无需配置镜像源。
+> 留空(默认)= 直连 Docker Hub 官方,**境外网络无需任何设置**。
+> `pansou` 走 `ghcr.io`,不受此变量影响(墙内通常可直连)。
+>
+> 另一条路是给 Docker daemon 配全局 `registry-mirrors`(`/etc/docker/daemon.json`),
+> 效果一样。`DOCKER_MIRROR` 的好处是只影响本项目、不需要 root、不用重启 daemon。
 
 打开 `http://<你的主机>:3000`:
-1. **设置 → 网盘**:在品牌瓦片里选一个开始连接——115 / 夸克 / 天翼 / 123 扫码登录,光鸭粘贴 token(见各品牌连接小节);凭证入库后自动用于转存。五个品牌可各绑一块盘,互为独立工作区。
+1. **设置 → 网盘**:在品牌瓦片里选一个开始连接——115 / 夸克 / 天翼 / 123 扫码登录,夸克与 UC 也可粘贴 cookie,光鸭粘贴 token(见各品牌连接小节);凭证入库后自动用于转存。五个品牌可各绑一块盘,互为独立工作区。
 2. 就这样。**TMDB 元数据经作者 CF Worker 开箱即用**(想用自己额度可在设置填 TMDB key);**PanSou 网盘搜索源已自带**。
 
 ### 组成 / 端口
@@ -105,9 +146,12 @@ docker compose up -d        # 首次会拉取 web 成品镜像和依赖服务
 
 ## 光鸭云盘(GuangYaPan)连接
 
-光鸭云盘(迅雷旗下,2026 年上线)是第三个支持的网盘品牌。它走**磁力 / 离线下载优先**路径:agent 把 PanSou(magnet 类型)与可选 Prowlarr 找到的磁力 / ed2k / BT 候选,经光鸭的离线下载 API 拉进你自己的盘——和 115 的离线任务路径同理。
+光鸭云盘(迅雷旗下,2026 年上线)和 115、123 一样走两条路:
 
-> ⚠️ **v1 仅支持磁力 / 离线。** 光鸭目前**不**转存 115 / 夸克 / 光鸭自己的**分享链**(这类候选会按设计明确报错 `GUANGYA_ONLY_MAGNET`,不静默失败)。所以光鸭和 **Prowlarr 搭配最好**(磁力覆盖更全)。
+- **光鸭分享链**(`guangyapan.com/s/…`):PanSou 搜到的光鸭分享,服务端直接转存进你的盘,文件夹整个转,几秒就完成。
+- **磁力 / ed2k / BT**:PanSou(magnet 类型)和可选 Prowlarr 找到的磁力,经光鸭的离线下载拉进盘里。
+
+> ⚠️ PanSou 上的光鸭分享有不少打得开却列不出文件(可能是分享者设了限制,或内容在审核),这种会明确报 `GUANGYA_SHARE_EMPTY`,agent 会换下一个候选。别的网盘(115 / 夸克 / UC / 123 / 天翼)的分享链落不到光鸭,会报 `GUANGYA_UNSUPPORTED_LINK`。想要磁力覆盖更全,可以再配 **Prowlarr**。
 >
 > 和所有获取一样,光鸭也需要先配好 **AI 模型(LLM)**,见下文「[想跑真实获取还需要](#想跑真实获取还需要)」。
 
@@ -153,20 +197,20 @@ docker compose up -d        # 首次会拉取 web 成品镜像和依赖服务
 
 - **连接**:设置 → 网盘 → 选「天翼云盘」→ 用天翼云盘 App 扫码。扫码不便时点开「手动粘 SSON cookie」:浏览器登录 [cloud.189.cn](https://cloud.189.cn) 后,从开发者工具 → Application → Cookies 里复制 `SSON` 的值粘入。
 - 会话由系统自动续期;显示「掉线」时重新扫码绑定同一账号即可恢复,追踪数据不丢。
-- 资源量提示:PanSou 上天翼分享目前偏少(电影尤其弱,剧/动漫可用),见 README 的分享量对比表。
+- 资源量提示:PanSou 上天翼分享目前偏少(电影尤其弱,剧/动漫可用),见[各盘资源量对比](drive-brand-evaluations.md#已支持五盘的资源量2026-07-抽样)。
 
 ## 123网盘连接
 
-123网盘是第五个支持的品牌,走**转存分享**路径(`123pan.com/s/…` 分享链;免费账号即可转存——转存是服务端秒传复制,不消耗提取流量)。
+123网盘是第五个支持的品牌,和 115 一样两条路:**转存分享**(`123pan.com/s/…` 分享链;免费账号即可转存——转存是服务端秒传复制,不消耗提取流量)和**磁力**(走 123 自己的离线下载)。
 
 - **连接**:设置 → 网盘 → 选「123网盘」→ 用 123网盘 App 扫码(登录约 **90 天**有效)。扫码不便时点开「手动粘 token」:浏览器登录 [123pan.com](https://www.123pan.com) 网页版后,开发者工具 → Application → Local Storage 里找 `eyJ…` 开头的登录 token 整段粘入。
 - token 到期后显示「掉线」,重新扫码即恢复。
-- v1 未启用 123 的磁力离线接口(免费配额极少);候选全部来自 PanSou 的 123 分享。
+- 磁力候选来自 PanSou 和 Prowlarr(配了的话);免费账号的离线下载额度很少,主要还是靠分享链。
 
 ## 想跑真实获取还需要
 
 - **AI 模型**(设置 → AI 模型):填一个 OpenAI 兼容的 `baseURL / apiKey / modelId`——agent 靠它决策。不填则获取流程无法规划。
-- **115 目录 CID**(`.env` 或环境变量):`TV_SHOWS_CID` / `MOVIES_CID` / `ANIME_CID` 等落盘父目录。
+- **网盘**(设置 → 网盘):扫码或粘凭证绑定。绑定时会在盘里自动建好 `Mediary Scout/{Movies,TV,Anime}` 三个落盘目录,不用手填目录 ID。
 
 ## 可选增强
 
@@ -174,7 +218,7 @@ docker compose up -d        # 首次会拉取 web 成品镜像和依赖服务
 - **出站代理**(`.env` 设 `HTTP_PROXY` / `HTTPS_PROXY`):墙内想用**自己的 TMDB token / 额度**时用得到。TMDB 的 API 主机(`api.themoviedb.org`)在国内常被单独墙(官网能开 ≠ API 能通),直连不到你的 token 就用不上。给容器配一个能穿透的代理即可让全部出站请求(TMDB / PanSou / Prowlarr)走它:在仓库根 `.env` 里写 `HTTP_PROXY=http://172.17.0.1:7890` 和 `HTTPS_PROXY=http://172.17.0.1:7890`(`172.17.0.1` 是 Docker 默认网关,指向宿主机;端口换成你宿主上代理软件的实际端口,如 Clash 的 7890),再 `docker compose up -d`。`NO_PROXY` 可排除内网地址。**不设代理时行为不变**——TMDB token 留空走作者内置代理依旧开箱即用,这条只为「墙内 + 想用自己 token」准备。
   - **内置代理也连不上时同样用此法**(#83 实例,现已缓解):内置 TMDB 代理曾托管在 `*.workers.dev` 域名下,该域名在部分国内网络/运营商下会被整域阻断——症状是搜索报 `All N TMDB access(es) failed: TimeoutError`(N 为通道数,未配 token 时为 1)。**现默认代理已换自定义域名 `tmdb-proxy.mediaryscout.app`,绝大多数国内网络可直连**;若你的网络连它也阻断,再按上面配 `HTTP_PROXY` / `HTTPS_PROXY` 让容器出站走代理。
   - **WSL2 部署注意**(#83 踩坑实录):容器内的 `127.0.0.1` 指容器自身,填 Windows 宿主上的代理要用 WSL2 虚拟网卡的宿主 IP;且 Windows 防火墙常拦截来自 WSL2 虚拟网卡的入站连接(即使代理软件开了「允许局域网连接」),需要放行防火墙或在 WSL2 内起一层转发(监听 0.0.0.0 转发到 127.0.0.1:代理端口),容器再指向 WSL2 自身 IP。
-- **Prowlarr**(设置 → 资源提供商):接入索引器聚合,磁力与 PanSou 结果合并,走 115 或光鸭的离线下载落盘(夸克无磁力 API)。
+- **Prowlarr**(设置 → 资源提供商):接入索引器聚合,磁力与 PanSou 结果合并,走 115 / 光鸭 / 123 的离线下载落盘(夸克、UC 和天翼没有可用的磁力接口)。
 - **换 PanSou 实例**(设置 → 资源提供商):默认用 compose 自带的;想指向别的实例/公共域名在此手填。
 
 ## 从你的设备访问
@@ -224,7 +268,15 @@ Mediary Scout 默认单用户、无登录。公网入口必须挡住,二选一:
 
 **方案 A(推荐):在应用里设访问密码**
 
-设置 → 账号 → 设置访问密码。设好之后:
+在**局域网**里打开 `http://<主机IP>:<端口>/login`(端口默认 3000,改过 `WEB_PORT` 就用那个),设置访问密码。第一次设置只能在局域网里做:外网打开还没设密码的实例只会看到一段提示,没人能抢先替你设。之后要改密码:多用户在「设置 → 账号 → 修改密码」;已开通 Mediary Connect 的单用户实例在「设置 → 远程访问」;其余单用户实例(比如自建隧道)在部署目录里跑下面三行——密码不回显,也不会出现在命令历史和进程参数里:
+
+```bash
+printf '新密码: '; stty -echo; IFS= read -r PW; stty echo; echo
+printf '%s' "$PW" | docker compose exec -T web node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",async()=>{const r=await fetch("http://127.0.0.1:3000/api/auth/password",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:s})});console.log(r.status,await r.text());process.exit(r.ok?0:1)})'
+unset PW
+```
+
+(请求从 web 容器内部发出,按局域网对待;成功会打印 `200`,所有登录会话随之失效,外网要用新密码重新登录。)设好之后:
 
 | 来源 | 行为 |
 |---|---|
@@ -287,8 +339,8 @@ c. 进这条隧道的 Public Hostname → Add a public hostname:
 - 在部署目录执行 `docker compose --profile tunnel up -d`
 - 首次会拉取 cloudflared 镜像(慢网络几分钟,正常)。
   **墙内若报 `failed to fetch anonymous token` / `connection reset by peer`,重试没用** ——
-  那是 Docker Hub 常年不稳定,请配置 Docker daemon 的 `registry-mirrors` 后再重跑
-  (见上方「Compose 快速开始」里的镜像源小节)。`connect.sh` 遇到这个错会直接给出该解法。
+  那是 Docker Hub 常年不稳定,在 `.env` 里加 `DOCKER_MIRROR=docker.1ms.run` 再重跑
+  (见上方「Compose 快速开始」里的镜像源小节)。`connect.sh` 遇到这个错会直接把解法打出来。
 
 第 4 步·确认连通:
 1. 先 `docker compose ps cloudflared` 应显示 Up(若 Starting/空,等 30 秒再看,别判失败)。
@@ -311,17 +363,26 @@ d. 登录身份默认走 One-time PIN(邮箱一次性验证码);若登录页提�
 完成后用简短中文汇报:隧道是否 Registered、Access 是否配置、面板是否(由用户确认)能进。
 ```
 
-### 方式三:Mediary Connect（受邀）
+### 方式三:Mediary Connect（付费托管隧道）
 
-若你收到作者的 Mediary Connect 邀请链接（`https://mediaryconnect.app/i/...`）:
+不想自己买域名、配 Cloudflare 的话,[Mediary Connect](https://mediaryconnect.app) 给你一个 `https://<你选的名字>.mediaryconnect.app`。
 
-1. 打开链接，按页显示一次连接信息（含 `TUNNEL_TOKEN`）。
-2. 写入实例 `.env` 的 `TUNNEL_TOKEN=...`（可复制页上的 Agent 提示词交给 coding agent 代配）。
-3. `docker compose --profile tunnel up -d`
-4. 浏览器打开页上的 `https://<slug>.mediaryconnect.app`，完成 Cloudflare Access 邮箱验证。
+**最省事:在实例里点完。** 局域网打开「设置 → 远程访问」:填邮箱 → 去邮箱点「确认连接」(核对邮件里的核对码和页面上的一样)→ 选时长,新标签页里微信付款 → 选名字 → 设好访问密码后点「接入」。实例自己取隧道凭据,由更新助手写 `.env`、启动 `cloudflared`(不重启 `web`,正在跑的下载不受影响),页面等到外网能打开才显示「已接通」。一键接入要用新版更新助手:更新助手不会跟着一键更新升级,老部署先在部署目录跑一次 `./scripts/deploy.sh`(或 `docker compose up -d --build updater`);没有新版更新助手时,页面会给出下面第 3 步那条命令,复制到部署目录跑就行。
 
-Public Hostname 与 Access 已由 Connect 控制面配好，服务目标固定为 compose 内 `http://web:3000`。
-网络不稳时可加 `TUNNEL_TRANSPORT_PROTOCOL=http2`。
+不想在实例里操作,也可以走控制台:
+
+1. **先在局域网设好访问密码**:打开 `http://<主机IP>:<端口>/login`(端口默认 3000,改过 `WEB_PORT` 就用那个)设一个。它是远程访问唯一的门禁;第一次设置只能在局域网里做。
+2. 在 mediaryconnect.app 用邮箱登录 → 控制台选时长(微信支付)→ 选一个名字。
+3. 控制台点「生成取件码」,然后在部署目录(`docker-compose.yml` 所在的目录)跑:
+
+   ```bash
+   curl -fsSL https://mediaryconnect.app/connect.sh | sh -s -- <取件码>
+   ```
+
+   脚本凭取件码换隧道凭据、写进 `.env`(`TUNNEL_TOKEN`、`MEDIARY_CONNECT_HOSTNAME`)、`docker compose --profile tunnel up -d`,轮询到隧道真通才报成功。取件码 15 分钟有效;部署目录不在当前路径时加 `--dir /path/to/deploy`。也可以复制控制台里的提示词,交给 coding agent 代办。
+4. 浏览器打开 `https://<名字>.mediaryconnect.app`,用访问密码登录。
+
+服务目标固定为 compose 内的 `http://web:3000`。网络不稳时在 `.env` 加 `TUNNEL_TRANSPORT_PROTOCOL=http2`,再 `docker compose --profile tunnel up -d`。
 
 ## 安全
 
@@ -353,10 +414,7 @@ Public Hostname 与 Access 已由 Connect 控制面配好，服务目标固定�
 
 ## 国内构建加速(Docker Hub 常年不稳定)
 
-Docker Hub 和 ghcr 在国内常年不稳定。当前 Compose 会直接拉取成品镜像,其中
-`postgres`、`cloudflared` 来自 Docker Hub,`web`、`pansou` 来自 GHCR。
-下面的 `registry-mirrors` **只解决 Docker Hub**;GHCR 的处理方式见本节末尾。
-典型报错(任一即是此问题):
+Docker Hub 和 ghcr 在国内常年不稳定,首次 `docker compose up` 构建 / 拉取会卡住。下面的镜像加速**只解决 Docker Hub**(占绝大多数镜像);来自 ghcr 的 `pansou` 是例外,见本节末尾。典型报错(任一即是此问题):
 
 ```
 failed to fetch oauth token: Post "https://auth.docker.io/token": ... i/o timeout
@@ -380,15 +438,12 @@ DeadlineExceeded / dial tcp ...:443: i/o timeout
 { "registry-mirrors": ["https://docker.1ms.run"] }
 ```
 
-如果需要手动从源码构建 web,可同时指定 Docker Hub 和 npm 镜像源:
+**npm 也慢的话**,构建时换国内源:
 ```bash
-docker build \
-  --build-arg DOCKER_MIRROR=docker.1ms.run \
-  --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
-  -t mediary-scout:local .
+docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 ```
 
-> 镜像地址会失效/限速,`docker.1ms.run` 只是示例;搜「Docker 镜像加速 可用」找当前能用的即可。Docker daemon 的 `registry-mirrors` 负责 Compose 拉取的 `postgres`、`cloudflared`;手动构建时的 `DOCKER_MIRROR` build arg 负责 Dockerfile 中的 `node`。本仓库 Dockerfile 已**特意不写 `# syntax=` 指令**,避免它绕过镜像、第一步就卡死(见 #46)。
+> 镜像地址会失效/限速,`docker.1ms.run` 只是示例;搜「Docker 镜像加速 可用」找当前能用的即可。配好后,所有 **Docker Hub** 镜像(`postgres`、构建 web 用的 `node`、`cloudflared`)都会走镜像 —— 本仓库 Dockerfile 已**特意不写 `# syntax=` 指令**,避免它绕过镜像、第一步就卡死(见 #46)。
 
 **⚠️ 注意 `pansou` 例外**:它来自 **ghcr.io**(`ghcr.io/fish2018/pansou-web`),而 Docker 的 `registry-mirrors` **只对 Docker Hub 生效、管不到 ghcr**。若 ghcr 也连不上,二选一:
 - 在 `.env` 设 `PANSOU_IMAGE=` 指向一个 ghcr 镜像/代理(如 `ghcr.nju.edu.cn/fish2018/pansou-web:latest`,镜像可用性自行确认),再 `docker compose up -d`;
@@ -402,19 +457,41 @@ docker build \
 ./scripts/deploy.sh
 ```
 
-`scripts/deploy.sh` 会 `git pull` → 拉取最新 `web` 成品镜像 → `up -d` → **验证运行容器与仓库处于同一 commit**(读取容器内 `BUILD_COMMIT` 与 `HEAD` 比对,不一致直接报错退出)。
+`scripts/deploy.sh` 会 `git pull` → 重建 `web` → `up -d` → **验证跑起来的容器确实是刚拉取的 commit**(读容器内 `BUILD_COMMIT` 和 `HEAD` 比对,不一致直接报错退出)。等价于 `docker compose up -d --build`,但多了那道**自校验**,并且不用 `--no-cache`。
 
-> **为什么要自校验?** `git pull` 完成并不代表 GHCR 的 `latest` 镜像已经构建完成,容器也可能因为拉取或重建异常继续运行旧代码。发布镜像内写有 `BUILD_COMMIT`;脚本将它与仓库 `HEAD` 比较,不一致时明确失败并提示等待 CI 完成后重试。
+> **为什么要自校验?** 升级最阴的失败是**静默回退**:`git pull` 之后容器仍在跑**旧代码**,而所有常规信号都在骗你——宿主 `git rev-parse HEAD` 显示的是新 commit(和容器里实际跑的代码无关),盯镜像 hash 也没用(`--no-cache` 重建每次 hash 都不同,纯粹是构建不确定性)。#88–#98 就是这样连续五次「部署成功」实则一整天跑旧代码。所以真正的护栏不是缓存技巧,而是**一道检查**:把镜像构建时刻的 commit 盖进 `BUILD_COMMIT`,部署后比对运行容器的 `BUILD_COMMIT` 是否等于 `HEAD`,不等就报错——无论病根是构建缓存、`git pull` 空转、还是容器没被重建,都会当场暴露而非静默溜过。
+>
+> `deploy.sh` 顺带传 `GIT_SHA=$(git rev-parse HEAD)` 作构建参数,Dockerfile 用它在 `COPY . .` 前触发缓存失效(ARG 在**首次使用**时 cache-miss,连带其后各层重建),每换 commit 强制重传源码 + 重建,而慢的 `npm ci` 依赖层仍走缓存。**不必 `--no-cache`**(那会把依赖层也丢掉,慢几分钟)。装了 buildx / 用内置 BuildKit 的宿主本就内容寻址、`COPY` 可靠,这层主要是给用**经典构建器**(`DOCKER_BUILDKIT=0` 或很老的 Docker)的自部署者兜底;两种构建器下都正确无副作用。
 >
 > 手动等价执行 + 校验:
 > ```bash
+> # 一键更新后部署目录停在发布标签上,pull 需要一个分支(deploy.sh 自己也会先做这一步):
+> git checkout main
 > git pull --ff-only
-> docker compose pull web
-> docker compose up -d
+> GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
 > # 核对容器真在跑新代码(应等于上面的 HEAD):
 > docker compose exec web cat BUILD_COMMIT
 > ```
 
+### 在网页里一键更新
+
+设置 → 更新会列出新的发布版本，自托管实例上有「立即更新」。
+
+新装的实例直接就有。从还没有更新助手的旧版本升级上来的，要先手动升级一次，更新助手容器才会起来。在部署目录运行：
+
+```bash
+./scripts/deploy.sh
+```
+
+一次更新会等正在跑的任务结束，把数据库备份到 `backups/pre-update-*.sql.gz`（只留最近 5 份），然后构建新版本——这段时间旧版本继续服务。构建好了先暂停开始新任务（已经排队的会留到新版本再跑），等正在跑的任务结束再替换，网页大约有一分钟打不开。接着检查新版本，没通过就自动回到旧版本；更新助手中途被重启，也会在重新启动后自动回到旧版本。
+
+它不会覆盖你改过的已跟踪文件。配置写在 `.env`。
+
+设置 → 更新里还有「每天自动更新」，默认关。打开后选一个整点（北京时间），到点若有新发布版本就自动更新一次；有获取任务在进行时会等它结束，和手动点「立即更新」一样。同一个发布版本连续两次没更新成功，就不再自动重试，直到你手动点一次「立即更新」。
+
+从 GitHub 下载新版本时，设了 `.env` 里的 `HTTPS_PROXY` / `HTTP_PROXY` 就走它——和应用其余出站请求（TMDB / PanSou 等）同一个代理；没设就直连。改了 `.env` 要在部署目录运行 `docker compose up -d` 才会生效。
+
+只有更新助手容器挂 Docker socket。它不映射任何端口，只接受「更新到这个发布标签」，令牌只有 web 容器能读。更新助手不会更新自己：一键更新只替换 web 容器。某个版本如果改了 `updater/`，发布说明会写明，那时在部署目录运行 `docker compose up -d --build updater`；运行 `./scripts/deploy.sh` 时它也会一并重建。
 
 ## 备份与恢复（pgdata）
 

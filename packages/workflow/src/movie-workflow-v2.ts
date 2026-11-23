@@ -1,3 +1,4 @@
+import type { AgentMemoryStore } from "./agent-memory.js";
 import type { LanguageModel } from "ai";
 import {
   createEpisodeStates,
@@ -13,15 +14,17 @@ import {
   type TransferAttempt,
   type WorkflowStatus,
 } from "./domain.js";
-import { buildMovieReport, emptyRunOutcome, formatReportPushText } from "./notification-report.js";
+import { buildMovieReport, buildReplacementReport, emptyRunOutcome, formatReportPushText } from "./notification-report.js";
 import { classifyTransferBlock } from "./acquisition-v2/transfer-block.js";
 import { classifySearchSourceFault } from "./acquisition-v2/search-source-fault.js";
-import type { ResourceProvider, StorageExecutor } from "./ports.js";
+import type { AcquisitionDriveContext, ResourceProvider, StorageExecutor } from "./ports.js";
 import type { DeadLinkStore } from "./acquisition-v2/dead-links.js";
 import { readLandedSize, type LandedSize } from "./acquisition-v2/landed-size.js";
 import type { AgentToolEvent } from "./acquisition-v2/activity.js";
-import { runAcquisitionV2 } from "./acquisition-v2/orchestrator.js";
+import { runAcquisitionV2, type RunAcquisitionV2Request, type RunAcquisitionV2Result } from "./acquisition-v2/orchestrator.js";
+import type { JevJudge } from "./jev-judge.js";
 import { getQualityGuidance, getSearchRecipe } from "./acquisition-v2/search-profile.js";
+import { cleanSelectionPreferenceForPrompt, appliedSelectionPreference } from "./selection-preference.js";
 import { ensureMediaLibraryDirectory } from "./media-library-folder.js";
 
 function defaultNowIso(): string {
@@ -47,32 +50,67 @@ export interface RunMovieAcquisitionV2Request {
   preferredLanguage?: string;
   /** Global quality preference ("high"/"medium"); undefined = 不限 (no guidance). */
   qualityPreference?: "high" | "medium";
+  /** User-authored standing selection preference (supersedes qualityPreference when non-empty). */
+  selectionPreference?: string;
   /** The run's drive brand ("pan115" | "quark") — selects brand-specific skill. */
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
   assrtToken?: string;
+  /** Optional Jev candidate prefilter (see orchestrator.jevJudge). */
+  jevJudge?: JevJudge;
   deadLinkStore?: DeadLinkStore;
+  /** Agent memory (see orchestrator.memory). */
+  memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
+  /** A replace_request run (see orchestrator.userRequest; requestedEpisodes ["MOVIE"]). */
+  userRequest?: RunAcquisitionV2Request["userRequest"];
+  /** Replace runs: the film was obtained before the run (its old file is there), so
+   *  it stays obtained whether or not a replacement landed. Default false. */
+  priorObtained?: boolean;
+  /** See orchestrator.protectExisting (episodes ["MOVIE"] when the film has a kept replacement). */
+  protectExisting?: RunAcquisitionV2Request["protectExisting"];
+  /** See orchestrator.rejectedLookup. */
+  rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
+  /** See orchestrator.linkHistory. */
+  linkHistory?: RunAcquisitionV2Request["linkHistory"];
+  /** Web-reference tools (alternate titles for a film). */
+  titleResearch?: RunAcquisitionV2Request["titleResearch"];
+  /** Ordered active drives for this account in unified multi-drive mode. */
+  drives?: AcquisitionDriveContext[];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
 
+/** The movie result plus the replace outcome of a replace_request run. */
+export type MovieAcquisitionV2Result = MovieWorkflowResult & {
+  replacement?: RunAcquisitionV2Result["replacement"];
+  touchedTargetDrives?: RunAcquisitionV2Result["touchedTargetDrives"];
+};
+
 export async function runMovieAcquisitionV2(
   request: RunMovieAcquisitionV2Request,
-): Promise<MovieWorkflowResult> {
+): Promise<MovieAcquisitionV2Result> {
   const now = request.now ?? defaultNowIso;
+  const multiDrive = Boolean(request.drives && request.drives.length > 0);
 
   // verify-or-create Movies/Title (Year) {tmdb-N} (legacy Title (Year) reused).
   // For a movie this dir IS the staging, the flatten target, and the final
   // location — there is NO separate staging (§5): transfer lands here, the
   // wrapper is flattened in place, mark. So stagingDirectoryId ===
   // targetMovieDirectoryId === the movie dir.
-  const movieDirectoryId = await ensureMediaLibraryDirectory({
-    executor: request.storage,
-    parentId: request.moviesParentDirectoryId,
-    title: request.title.title,
-    year: request.title.year ?? "—",
-    tmdbId: request.title.tmdbId,
-  });
+  // In multi-drive mode, MultiDriveStorageV2 creates the movie directory lazily
+  // on whichever drive actually receives the transfer.
+  const movieDirectoryId = multiDrive
+    ? ""
+    : await ensureMediaLibraryDirectory({
+        executor: request.storage,
+        parentId: request.moviesParentDirectoryId,
+        title: request.title.title,
+        year: request.title.year ?? "—",
+        tmdbId: request.title.tmdbId,
+      });
+
+  const cleanSelectionPref = cleanSelectionPreferenceForPrompt(request.selectionPreference);
+  const movieQualityGuidance = getQualityGuidance("movie", request.qualityPreference);
 
   const v2 = await runAcquisitionV2({
     provider: request.resourceProvider,
@@ -85,14 +123,14 @@ export async function runMovieAcquisitionV2(
       aliases: request.title.aliases,
       year: request.title.year ?? 0,
       qualityPreference: "4K",
+      tmdbId: request.title.tmdbId,
     },
     stagingDirectoryId: movieDirectoryId,
     targetMovieDirectoryId: movieDirectoryId,
     searchHints: getSearchRecipe("movie"), // movie search is origin-independent
     searchProfile: "movie",
-    ...(getQualityGuidance("movie", request.qualityPreference) === ""
-      ? {}
-      : { qualityGuidance: getQualityGuidance("movie", request.qualityPreference) }),
+    ...(cleanSelectionPref === "" ? {} : { selectionPreference: cleanSelectionPref }),
+    ...(movieQualityGuidance === "" ? {} : { qualityGuidance: movieQualityGuidance }),
     ...(request.searchBudget === undefined ? {} : { searchBudget: request.searchBudget }),
     ...(request.maxSteps === undefined ? {} : { maxSteps: request.maxSteps }),
     ...(request.preferredLanguage === undefined ? {} : { preferredLanguage: request.preferredLanguage }),
@@ -100,22 +138,44 @@ export async function runMovieAcquisitionV2(
     ...(request.title.originCountries === undefined ? {} : { originCountries: request.title.originCountries }),
     ...(request.storageProvider === undefined ? {} : { storageProvider: request.storageProvider }),
     ...(request.assrtToken === undefined ? {} : { assrtToken: request.assrtToken }),
+    ...(request.jevJudge === undefined ? {} : { jevJudge: request.jevJudge }),
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
+    ...(request.memory ? { memory: request.memory } : {}),
+    ...(request.userRequest ? { userRequest: request.userRequest } : {}),
+    ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
+    ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
+    ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
+    ...(request.titleResearch === undefined ? {} : { titleResearch: request.titleResearch }),
+    ...(request.drives === undefined ? {} : { drives: request.drives }),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 
   // Truth = the AGENT'S coverage (its markObtained), NOT a mechanical file scan
   // (§1.13/§7b). The agent looked at the real files and declared coverage; the
   // workflow records that, it does not re-derive obtained by counting files.
-  const obtained = v2.coverage.coverageMet;
+  // A replace run never un-obtains the film: the old file stays in the directory
+  // whether or not a replacement landed (spec §4.5). One that was never obtained
+  // is obtained only by what landed now.
+  const obtained = v2.coverage.coverageMet || (request.userRequest !== undefined && request.priorObtained === true);
 
   // Real landed volume for the push (best-effort; never fails the run). The
   // movie dir IS the staging+final location, so its video file(s) are the film.
-  const landed = obtained ? await readLandedSize(request.storage, [movieDirectoryId]) : undefined;
+  // Not on a replace run: the dir holds the old AND the new film (double count).
+  const firstTouchedMovieDrive = v2.touchedTargetDrives?.[0];
+  const resolvedMovieDirectoryId =
+    firstTouchedMovieDrive?.directoryIds[0] ?? movieDirectoryId;
+  let landed: { fileCount: number; totalBytes: number } | undefined;
+  if (obtained && !request.userRequest) {
+    if (firstTouchedMovieDrive) {
+      landed = await readLandedSize(firstTouchedMovieDrive.executor, firstTouchedMovieDrive.directoryIds);
+    } else if (!multiDrive) {
+      landed = await readLandedSize(request.storage, [movieDirectoryId]);
+    }
+  }
 
-  return buildResult({
+  const result = buildResult({
     request,
-    movieDirectoryId,
+    movieDirectoryId: resolvedMovieDirectoryId,
     obtained,
     status: obtained ? "succeeded" : "no_coverage",
     kind: obtained ? "movie_init" : "no_coverage",
@@ -126,8 +186,14 @@ export async function runMovieAcquisitionV2(
     // 中文字幕软兜底: the agent landed a raw match with no confirmed 中字 → flag it.
     subtitleFallback: obtained && v2.coverage.subtitleFallback,
     ...(landed ? { landed } : {}),
+    ...(v2.replacement ? { replacementResults: v2.replacement.results } : {}),
     now,
   });
+  return {
+    ...result,
+    ...(v2.replacement ? { replacement: v2.replacement } : {}),
+    ...(v2.touchedTargetDrives ? { touchedTargetDrives: v2.touchedTargetDrives } : {}),
+  };
 }
 
 function buildResult(input: {
@@ -143,6 +209,8 @@ function buildResult(input: {
   /** Landed via the 中文字幕 last-resort fallback (no confirmed 中字) → notification flag. */
   subtitleFallback?: boolean;
   landed?: LandedSize;
+  /** A replace_request run: the notification reports the replacement, not "入库". */
+  replacementResults?: Array<{ episode: string; outcome: "replaced" | "not_found" }>;
   now: () => string;
 }): MovieWorkflowResult {
   const season: TrackedSeason = movieAnchorSeason({
@@ -158,9 +226,49 @@ function buildResult(input: {
   }).map((episode) => ({ ...episode, obtained: input.obtained }));
 
   const t = input.request.title;
+  const selectionPreference = appliedSelectionPreference(input.auditEvents);
+  const meta = {
+    posterPath: t.posterPath ?? null,
+    tmdbId: t.tmdbId,
+    mediaType: t.type,
+    year: t.year,
+    ...(selectionPreference ? { selectionPreference } : {}),
+  };
+  if (input.request.userRequest) {
+    const report = buildReplacementReport({
+      titleName: t.title,
+      movie: true,
+      results: input.replacementResults ?? [],
+      transferBlockReason: classifyTransferBlock(input.attempts)?.reason ?? null,
+      searchSourceFaultReason: classifySearchSourceFault(input.auditEvents)?.reason ?? null,
+      meta,
+    });
+    const notification: NotificationEvent = {
+      id: `notification_${input.request.workflowRunId}`,
+      workflowRunId: input.request.workflowRunId,
+      kind: report.status === "failed" ? "transfer_failed" : "replacement_done",
+      title: t.title,
+      body: formatReportPushText(report),
+      createdAt: input.now(),
+      trigger: "user",
+      report,
+    };
+    return {
+      status: input.status,
+      title: t,
+      season,
+      episodes,
+      resourceSnapshots: input.snapshots,
+      transferAttempts: input.attempts,
+      decisions: input.decisions,
+      notification,
+      notifications: [notification],
+      auditEvents: input.auditEvents,
+    };
+  }
   const baseReport = buildMovieReport(
     t.title,
-    { posterPath: t.posterPath ?? null, tmdbId: t.tmdbId, mediaType: t.type, year: t.year },
+    meta,
     input.landed,
     input.subtitleFallback ?? false,
   );

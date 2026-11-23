@@ -1,3 +1,7 @@
+import { parseGuangYaShareUrl } from "./guangya-client.js";
+import { parseQuarkShareUrl, parseUcShareUrl } from "./quark-storage-executor.js";
+import { parsePan123ShareUrl } from "./pan123-storage-executor.js";
+import { parseTianyiShareUrl } from "./tianyi-storage-executor.js";
 import { createHash } from "node:crypto";
 import type {
   ResourceCandidate,
@@ -27,6 +31,34 @@ export interface PanSouFetchInit {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 
+/** PanSou searches in progress per server, across every provider in this process.
+ *  One PanSou fans each search out to dozens of channels and starts answering 502
+ *  at about four simultaneous searches (measured 2026-09-25); parallel patrol runs
+ *  share it, so their searches queue here instead of failing as "source down". */
+const MAX_IN_FLIGHT_PER_SERVER = 2;
+const serverSlots = new Map<string, { inFlight: number; waiters: Array<() => void> }>();
+
+async function withServerSlot<T>(baseURL: string, call: () => Promise<T>): Promise<T> {
+  let slot = serverSlots.get(baseURL);
+  if (!slot) {
+    slot = { inFlight: 0, waiters: [] };
+    serverSlots.set(baseURL, slot);
+  }
+  if (slot.inFlight >= MAX_IN_FLIGHT_PER_SERVER) {
+    await new Promise<void>((resolve) => slot!.waiters.push(resolve));
+  } else {
+    slot.inFlight += 1;
+  }
+  try {
+    return await call();
+  } finally {
+    // Hand the slot straight to the next waiter (inFlight unchanged), or free it.
+    const next = slot.waiters.shift();
+    if (next) next();
+    else if ((slot.inFlight -= 1) === 0) serverSlots.delete(baseURL);
+  }
+}
+
 export type PanSouFetchJson = (url: string, init: PanSouFetchInit) => Promise<unknown>;
 
 export interface PanSouResourceProviderOptions {
@@ -49,7 +81,6 @@ export interface PanSouResourceProviderOptions {
 interface PanSouLinkFact {
   title: string;
   source: string;
-  sourceId: string;
   type: ResourceType;
   rawType: string;
   url: string;
@@ -99,13 +130,19 @@ export class PanSouResourceProvider implements ResourceProvider {
     if (!isPanSouSuccessResponse(response)) {
       throw new PanSouProtocolError(`not a PanSou payload from ${this.baseURL}`);
     }
-    const facts = collectLinkFacts(response.data.results);
+    const facts = collectLinkFacts(response.data.results ?? []);
     // Per-brand filter: a quark drive only sees quark links; a 115 drive only
     // sees 115/magnet. Keeps a candidate set that its executor can actually transfer.
     return this.allowedTypes ? facts.filter((fact) => this.allowedTypes!.has(fact.type)) : facts;
   }
 
   async search(input: { keyword: string; workflowRunId?: string }): Promise<ResourceSnapshot> {
+    // The slot covers the whole poll loop, not each request: between polls PanSou
+    // is still fanning the search out to its channels, which is the load that 502s.
+    return withServerSlot(this.baseURL, () => this.pollSearch(input));
+  }
+
+  private async pollSearch(input: { keyword: string; workflowRunId?: string }): Promise<ResourceSnapshot> {
     // PanSou is async/streaming: the first call returns quick cached results and
     // async-plugin results land on LATER calls (5 → 35 115-links, 0 → 419
     // magnets). Poll until the link count stops growing so the agent always
@@ -149,7 +186,6 @@ export class PanSouResourceProvider implements ResourceProvider {
         password: fact.password,
         datetime: fact.datetime,
         rawType: fact.rawType,
-        ...(fact.sourceId ? { sourceId: fact.sourceId } : {}),
       },
     }));
 
@@ -194,16 +230,47 @@ function isPanSouErrorResponse(value: unknown): boolean {
   return typeof value["code"] === "number" && value["code"] !== 0;
 }
 
+/** PanSou `SearchResponse` data (fish2018/pansou model/response.go). `Results` is
+ *  tagged `json:"results,omitempty"`, so a search with ZERO hits serialises as
+ *  `{"code":0,"message":"success","data":{"total":0}}` — no `results` key at all
+ *  (verified live 2026-09-19 on the self-hosted container and so.252035.xyz).
+ *
+ *  Rule, in order:
+ *   1. a PRESENT `results` must be an array — a numeric `total` never excuses a
+ *      malformed one (an object would blow up `for...of` and be misread as
+ *      「源挂了」; a string would iterate silently and look like a healthy miss);
+ *      `null` counts as absent (encoding/json writes null for a nil slice on a
+ *      build without omitempty);
+ *   2. with `results` absent, a numeric `total` is the zero-hit signature;
+ *   3. anything else is not PanSou.
+ *
+ *  Exported so the settings-page save probe applies the SAME rule: the two
+ *  drifting apart is exactly how a probe could persist an address the provider
+ *  then cannot consume (Copilot, #259). */
+export function isPanSouSearchData(
+  data: unknown,
+): data is { results?: unknown[] | null; total?: number } {
+  if (!isRecord(data)) return false;
+  const results = data["results"];
+  if (results !== undefined && results !== null) {
+    return Array.isArray(results);
+  }
+  return typeof data["total"] === "number";
+}
+
 function isPanSouSuccessResponse(value: unknown): value is {
   code: 0;
   data: {
-    results: unknown[];
+    results?: unknown[] | null;
+    total?: number;
   };
 } {
-  if (!isRecord(value) || value["code"] !== 0 || !isRecord(value["data"])) {
+  if (!isRecord(value) || value["code"] !== 0) {
     return false;
   }
-  return Array.isArray(value["data"]["results"]);
+  // Treating the zero-hit shape as "not a PanSou payload" turned every honest
+  // miss into a false 「搜索源连不上」 alert (2026-09-07 → 09-19, daily patrol).
+  return isPanSouSearchData(value["data"]);
 }
 
 function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
@@ -214,10 +281,8 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
     if (!isRecord(result)) {
       continue;
     }
-    const resultTitle = stringValue(result["title"]);
-    const sourceId = stringValue(result["unique_id"]).trim();
-    const source = panSouResultSource(result);
-    const resultDatetime = usablePanSouDatetime(result["datetime"]);
+    const title = stringValue(result["title"]);
+    const source = stringValue(result["channel"]);
     const links = Array.isArray(result["links"]) ? result["links"] : [];
     for (const link of links) {
       if (!isRecord(link)) {
@@ -231,14 +296,13 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
       }
       seenUrls.add(url);
       facts.push({
-        title: stringValue(link["work_title"]).trim() || resultTitle,
+        title,
         source,
-        sourceId,
         type,
         rawType,
         url,
         password: stringValue(link["password"]),
-        datetime: usablePanSouDatetime(link["datetime"]) || resultDatetime,
+        datetime: stringValue(link["datetime"]),
       });
     }
   }
@@ -246,32 +310,49 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
   return facts;
 }
 
-function normalizeResourceType(rawType: string, url: string): ResourceType | null {
-  if (rawType === "115") {
-    return "115";
-  }
-  if (rawType === "quark" || url.includes("pan.quark.cn/s/")) {
-    return "quark";
-  }
-  // 123 share shapes mirror parsePan123ShareUrl (pan123-storage-executor):
-  // multi-mirror domains 123pan/123684/123865/123912 · com/cn, path /s/<key>.
-  if (rawType === "123" || /123(?:684|865|912|pan)\.(?:com|cn)\/s\//.test(url)) {
-    return "123";
-  }
-  // 天翼 share shapes mirror parseTianyiShareUrl (tianyi-storage-executor):
-  // cloud.189.cn/t/<code> (the probe-confirmed PanSou link shape) and
-  // cloud.189.cn/web/share?…code=<code> (the ?code= is required — the executor
-  // can't parse a code-less share URL). Deliberately NOT bare "cloud.189.cn/",
-  // which would misclassify non-share 189 URLs (e.g. the web portal).
-  if (
-    rawType === "tianyi" ||
-    url.includes("cloud.189.cn/t/") ||
-    /cloud\.189\.cn\/web\/share\?[^#]*\bcode=/.test(url)
-  ) {
-    return "tianyi";
-  }
+/** Classify one upstream link by its URL SHAPE.
+ *
+ *  The declared `rawType` is deliberately ignored. Every branch here validates the
+ *  URL through the same parser its executor transfers with, so `rawType` would add
+ *  no information — but it used to be able to SUBTRACT: a link tagged `"115"` whose
+ *  url was a quark share hit the 115 branch, failed the shape check, and returned
+ *  null before the quark parser ever ran. Checking shapes in order is both simpler
+ *  and strictly more forgiving of a mislabelled upstream. (Verified against 7,843
+ *  real production candidates: the two agree on every share link we serve.)
+ *
+ *  `_rawType` is kept in the signature so both providers call it the same way. */
+export function normalizeResourceType(_rawType: string, url: string): ResourceType | null {
+  // Magnets first, regardless of any declared brand: a magnet is transferable by
+  // whichever drive has 秒传, and every executor routes on candidate.type ===
+  // "magnet". Checking brands first would drop every 115-sourced torrent.
   if (url.startsWith("magnet:")) {
     return "magnet";
+  }
+  // 115 shares live on 115.com/s/<code> or 115cdn.com/s/<code> — the exact
+  // prefixes storage-115-executor will transfer.
+  if (/^https?:\/\/(?:www\.)?115(?:cdn)?\.com\/s\/[A-Za-z0-9]+/.test(url)) {
+    return "115";
+  }
+  // Each of these is the SAME parser the executor transfers with, so a lookalike
+  // host (evilpan.quark.cn, evil.example.com/pan.quark.cn/s/x) can never become a
+  // candidate that then fails as unparseable at transfer time.
+  if (parseQuarkShareUrl(url) !== null) {
+    return "quark";
+  }
+  if (parseUcShareUrl(url) !== null) {
+    return "uc";
+  }
+  // 123 share shapes: multi-mirror domains 123pan/123684/123865/123912 · com/cn,
+  // path /s/<key>.
+  if (parsePan123ShareUrl(url) !== null) {
+    return "123";
+  }
+  // 天翼: cloud.189.cn/t/<code> and cloud.189.cn/web/share?…code=<code>.
+  if (parseTianyiShareUrl(url) !== null) {
+    return "tianyi";
+  }
+  if (parseGuangYaShareUrl(url) !== null) {
+    return "guangya";
   }
   return null;
 }
@@ -292,7 +373,6 @@ function createSnapshotId(keyword: string, facts: PanSouLinkFact[], workflowRunI
       password: fact.password,
       datetime: fact.datetime,
       source: fact.source,
-      sourceId: fact.sourceId,
     })),
   });
   const hash = createHash("sha1").update(material).digest("hex").slice(0, 12);
@@ -303,23 +383,6 @@ function createSnapshotId(keyword: string, facts: PanSouLinkFact[], workflowRunI
 
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
-}
-
-function panSouResultSource(result: Record<string, unknown>): string {
-  const channel = stringValue(result["channel"]).trim();
-  if (channel) return channel;
-
-  const uniqueId = stringValue(result["unique_id"]).trim();
-  const separator = uniqueId.indexOf("-");
-  return separator > 0 ? `plugin:${uniqueId.slice(0, separator)}` : "";
-}
-
-function usablePanSouDatetime(value: unknown): string {
-  const raw = stringValue(value).trim();
-  if (!raw) return "";
-
-  const date = new Date(raw);
-  return !Number.isNaN(date.getTime()) && date.getUTCFullYear() <= 1 ? "" : raw;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

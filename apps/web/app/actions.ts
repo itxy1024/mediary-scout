@@ -5,14 +5,11 @@ import { queueCandidateSeries, queueCandidateTracking, reserveCandidate } from "
 import { assertNotDemo } from "../lib/demo-mode";
 
 /**
- * Acquire-time LLM pre-check (issue #52). Returns a not-started result carrying
- * the friendly "未配置 AI 模型" message when a live (vercel-ai) acquisition can't
- * run for lack of LLM config — so the click does NOT enqueue a doomed run that
- * would only fail later in the worker (no wasted spin, no failed card in 活动).
- * Returns null when an LLM is configured (common case → unchanged behavior) or on
- * the fake/demo adapter (never needs an LLM → never blocked). Shared by every
- * acquire entry point. Resolves config the SAME way the worker does
- * (account-scoped DB → env), via acquireLlmPreflightError.
+ * Acquire-time LLM pre-check (issue #52) — NARROWED with the shipped free preset:
+ * 零配置时 resolveAgentModelConfig 回落 FREE_LLM_PRESET，不再拦截（开箱即用）；
+ * acquireLlmPreflightError 只拦半截配置（baseURL/modelId 一空一非空）——那种
+ * run 入队后会在 claim 前死于 llmConfigError 且无人收尸（ghost run），所以在
+ * 点击时用同一条文案友好拦下（详见其注释）。
  */
 async function acquireLlmNotConfigured(): Promise<RequestTrackingActionResult | null> {
   const { getCurrentAccountId, acquireLlmPreflightError } = await import("../lib/workflow-runtime");
@@ -91,12 +88,28 @@ export interface ConnectQuarkActionResult {
 
 /** Settings "添加网盘 → 夸克": bind a pasted 夸克 cookie as a new drive. */
 export async function connectQuarkAction(cookie: string): Promise<ConnectQuarkActionResult> {
+  return connectCloudFamilyCookieAction(cookie, "quark");
+}
+
+/** Settings "添加网盘 → UC网盘": bind a pasted UC cookie as a new drive. Same
+ *  family protocol as 夸克, so it reuses the whole connect/probe/provision path. */
+export async function connectUcAction(cookie: string): Promise<ConnectQuarkActionResult> {
+  return connectCloudFamilyCookieAction(cookie, "uc");
+}
+
+/** Shared body for the 阿里云盘族 (夸克 / UC) cookie actions — the two differ only
+ *  in which runtime function runs and the label in the success message. */
+async function connectCloudFamilyCookieAction(
+  cookie: string,
+  provider: "quark" | "uc",
+): Promise<ConnectQuarkActionResult> {
   assertNotDemo();
+  const label = provider === "uc" ? "UC网盘" : "夸克网盘";
   try {
-    const { connectQuarkCookie } = await import("../lib/workflow-runtime");
-    const { providerUid } = await connectQuarkCookie(cookie);
+    const { connectQuarkCookie, connectUcCookie } = await import("../lib/workflow-runtime");
+    const { providerUid } = await (provider === "uc" ? connectUcCookie(cookie) : connectQuarkCookie(cookie));
     revalidatePath("/settings");
-    return { ok: true, message: `夸克网盘已连接（账号 ${providerUid.slice(0, 10)}…）。` };
+    return { ok: true, message: `${label}已连接（账号 ${providerUid.slice(0, 10)}…）。` };
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) };
   }
@@ -293,8 +306,15 @@ export async function importForeignWorkAction(input: {
   if (input.providerFileIds.length === 0) {
     return { status: "failed", message: "没有可入库的文件。" };
   }
+  const { importForeignWorkFiles, isUpdateInProgress, UpdateInProgressError } = await import("../lib/workflow-runtime");
+  // A container swap mid-import leaves a half-moved folder the retry can't finish. Refuse
+  // upfront while the updater holds new work; importForeignWorkFiles rechecks the hold once
+  // it is counted in flight and throws UpdateInProgressError if the hold was taken in the
+  // gap between here and there, so the swap handshake cannot win that race.
+  if (isUpdateInProgress()) {
+    return { status: "failed", message: "正在更新，更新完成后再入库。" };
+  }
   try {
-    const { importForeignWorkFiles } = await import("../lib/workflow-runtime");
     await importForeignWorkFiles({
       providerFileIds: input.providerFileIds,
       movieTitle,
@@ -306,6 +326,9 @@ export async function importForeignWorkAction(input: {
       message: `已入库到 ${movieTitle} (${year})。`,
     };
   } catch (error) {
+    if (error instanceof UpdateInProgressError) {
+      return { status: "failed", message: "正在更新，更新完成后再入库。" };
+    }
     return { status: "failed", message: `入库失败：${String(error)}` };
   }
 }
@@ -479,12 +502,34 @@ export async function saveDailySweepTimesAction(times: string[]): Promise<PushSe
   }
 }
 
+export async function savePatrolConcurrencyAction(value: number): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, PATROL_CONCURRENCY_SETTING_KEY, MAX_PATROL_CONCURRENCY } = await import(
+      "../lib/workflow-runtime"
+    );
+    if (!Number.isInteger(value) || value < 1 || value > MAX_PATROL_CONCURRENCY) {
+      return { success: false, message: `只能是 1 到 ${MAX_PATROL_CONCURRENCY}` };
+    }
+    await getWorkflowRepository().setSetting(PATROL_CONCURRENCY_SETTING_KEY, String(value));
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
 /** 手动触发一次全量巡检（force：跑完整 sweep 但不认领定时 slot，run-now 不吞计划）。 */
 export async function runPatrolNowAction(): Promise<PushSettingsActionResult & { checked?: number }> {
   assertNotDemo();
   try {
-    const { runScheduledType3 } = await import("../lib/workflow-runtime");
+    const { runScheduledType3, workerHasConfiguredDrive } = await import("../lib/workflow-runtime");
+    if (typeof workerHasConfiguredDrive === "function" && !(await workerHasConfiguredDrive())) {
+      return { success: false, message: "尚未连接任何网盘，请先在「网盘连接」中绑定网盘后再巡检。" };
+    }
     const result = await runScheduledType3({ force: true });
+    if (result.skipped === "update_in_progress") {
+      return { success: false, message: "正在更新，更新完成后再巡检。" };
+    }
     return { success: true, checked: result.outcomes.length };
   } catch (error) {
     return { success: false, message: `巡检失败：${String(error)}` };
@@ -512,14 +557,49 @@ export async function saveQualityPreferenceAction(
 ): Promise<PushSettingsActionResult> {
   assertNotDemo();
   try {
-    const { getWorkflowRepository, getCurrentAccountId, QUALITY_PREFERENCE_SETTING_KEY } = await import(
+    const { getWorkflowRepository, requireAuthenticatedAccountId, QUALITY_PREFERENCE_SETTING_KEY } = await import(
       "../lib/workflow-runtime"
     );
     const repository = getWorkflowRepository();
-    await repository.setAccountSetting(await getCurrentAccountId(), QUALITY_PREFERENCE_SETTING_KEY, quality.trim());
+    await repository.setAccountSetting(await requireAuthenticatedAccountId(), QUALITY_PREFERENCE_SETTING_KEY, quality.trim());
     return { success: true };
   } catch (error) {
     return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function saveSelectionPreferenceAction(
+  preference: string,
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { normalizeSelectionPreference, SELECTION_PREFERENCE_MAX_LENGTH } = await import(
+      "@media-track/workflow"
+    );
+    const normalized = normalizeSelectionPreference(preference);
+    if (normalized.length > SELECTION_PREFERENCE_MAX_LENGTH) {
+      return {
+        success: false,
+        message: `选源要求最多 ${SELECTION_PREFERENCE_MAX_LENGTH} 字（当前 ${normalized.length} 字）`,
+      };
+    }
+    const {
+      getWorkflowRepository,
+      requireAuthenticatedAccountId,
+      SELECTION_PREFERENCE_SETTING_KEY,
+    } = await import("../lib/workflow-runtime");
+    const accountId = await requireAuthenticatedAccountId();
+    await getWorkflowRepository().setAccountSetting(
+      accountId,
+      SELECTION_PREFERENCE_SETTING_KEY,
+      normalized,
+    );
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : `保存失败：${String(error)}`,
+    };
   }
 }
 
@@ -543,8 +623,17 @@ export async function saveLlmConfigAction(input: {
     // Normalize base URL (the provider appends /chat/completions itself) and
     // strip all whitespace/invisible chars from the key — paste contamination
     // would otherwise silently store a wrong value (大误会).
-    await repository.setAccountSetting(accountId, LLM_BASE_URL_SETTING_KEY, normalizeLlmBaseUrl(input.baseURL));
-    await repository.setAccountSetting(accountId, LLM_MODEL_ID_SETTING_KEY, input.modelId.trim());
+    const baseURL = normalizeLlmBaseUrl(input.baseURL);
+    // 清空服务地址 = 放弃自定义配置：没有 baseURL 的 modelId 无意义，留着只会
+    // 制造半截行 —— resolveAgentModelConfig 对「url/model 双空」回落出厂免费预设
+    // （apiKey 不参与判定，见其注释），半截配置照原样返回、下游 llmConfigError
+    // fail-fast。所以 baseURL 为空时把 modelId 一并写空（整行清空 → 解析层回落
+    // Kilo 免费池，残留 key 也会被回落分支丢弃），让设置页「清空地址保存即恢复
+    // 默认」的文案为真（免费态表单预填预设值，用户通常只清地址）。baseURL 非空
+    // 时行为不变：modelId 照用户输入（trim）存。API Key 语义不动（blank-keep，
+    // 见下）。
+    await repository.setAccountSetting(accountId, LLM_BASE_URL_SETTING_KEY, baseURL);
+    await repository.setAccountSetting(accountId, LLM_MODEL_ID_SETTING_KEY, baseURL ? input.modelId.trim() : "");
     // Only overwrite the key when the user actually typed a new one — a blank
     // submit keeps the stored key (the form never echoes it back).
     const apiKey = sanitizeLlmApiKey(input.apiKey);
@@ -557,6 +646,59 @@ export async function saveLlmConfigAction(input: {
   }
 }
 
+/** 一键换回出厂免费模型：把 FREE_LLM_PRESET 写进本账号 settings（与
+ *  saveLlmConfigAction 同一落点），让生效配置立即回到出厂免费档。已存的
+ *  API Key 不动 —— 免费池无 key 直连用不到它，用户以后再换成自己的服务时
+ *  key 还在（与 saveLlmConfigAction 的 blank-keep 语义一致）。 */
+export async function restoreFreeLlmAction(): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  // 覆盖前记旧值，用于失败时的补偿回滚：两次 setSetting（baseURL、modelId）之间
+  // 若第二次失败，baseURL 已是 Kilo、modelId 仍旧值 —— 持续生效的混合配置，用户
+  // 不重试就不会自愈。选补偿回滚而非 repository 事务：现有 repository 只有逐 key
+  // setSetting，为这相邻两次写加批量事务 API 超出本 PR 范围；两次写之间失败概率
+  // 极低，回滚已把后果从「持续混合配置」降为「无变化」。undefined = 连旧值都没
+  // 读到（import/账号解析就失败，第一写从未发生）→ 没有可回滚的状态，别乱写库。
+  let previousBaseUrl: string | null | undefined;
+  try {
+    const { FREE_LLM_PRESET, normalizeLlmBaseUrl } = await import("@media-track/workflow");
+    const { getWorkflowRepository, getCurrentAccountId, LLM_BASE_URL_SETTING_KEY, LLM_MODEL_ID_SETTING_KEY } =
+      await import("../lib/workflow-runtime");
+    const repository = getWorkflowRepository();
+    const accountId = await getCurrentAccountId();
+    previousBaseUrl = await repository.getAccountSetting(accountId, LLM_BASE_URL_SETTING_KEY);
+    // baseURL 走与 saveLlmConfigAction 相同的 normalize，保证写库值与
+    // resolveAgentModelConfig 回落形态逐字一致（isFreeLlmPreset 按此比较）。
+    await repository.setAccountSetting(accountId, LLM_BASE_URL_SETTING_KEY, normalizeLlmBaseUrl(FREE_LLM_PRESET.baseURL));
+    await repository.setAccountSetting(accountId, LLM_MODEL_ID_SETTING_KEY, FREE_LLM_PRESET.modelId);
+    return { success: true };
+  } catch (error) {
+    // 第一写之后失败 → best-effort 把 baseURL 写回旧值。旧值为 null（从未配置）
+    // 时写空串：getLlmConfig 把空串归一为 undefined，与 null 等价（saveLlmConfigAction
+    // 的「整行清空」同一语义）。回滚自身失败只进日志，绝不掩盖/替换原始错误。
+    if (previousBaseUrl !== undefined) {
+      try {
+        const { getWorkflowRepository, getCurrentAccountId, LLM_BASE_URL_SETTING_KEY } = await import(
+          "../lib/workflow-runtime"
+        );
+        await getWorkflowRepository().setAccountSetting(
+          await getCurrentAccountId(),
+          LLM_BASE_URL_SETTING_KEY,
+          previousBaseUrl ?? "",
+        );
+      } catch (rollbackError) {
+        console.error(
+          `[restore-free-llm-action] rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+    }
+    // 内部细节（DB 报错、堆栈、路径）不回传浏览器 —— 与 web 端 runAction 的
+    // 泛化错误边界同一思路（那边也是刻意丢掉异常只给固定文案）。原始错误进
+    // 服务端日志供排查。
+    console.error(`[restore-free-llm-action] failed: ${error instanceof Error ? error.message : String(error)}`);
+    return { success: false, message: "换回失败，请稍后重试" };
+  }
+}
+
 export async function testLlmConnectionAction(): Promise<{ ok: boolean; message: string }> {
   try {
     assertNotDemo();
@@ -564,7 +706,7 @@ export async function testLlmConnectionAction(): Promise<{ ok: boolean; message:
       "../lib/workflow-runtime"
     );
     const accountId = await getCurrentAccountId();
-    // Resolve EXACTLY as the worker does (account-scoped → env). No default endpoint.
+    // Resolve EXACTLY as the worker does (account-scoped → env → 出厂免费预设回落).
     const cfg = await resolveAgentModelConfig(getAccountScopedSettings(accountId));
     const { createAgentModel, llmConfigError } = await import("@media-track/workflow");
     // BYO + agnostic: baseURL + 模型 are required; API Key is optional (keyless
@@ -641,6 +783,13 @@ export async function clearAssrtTokenAction(): Promise<PushSettingsActionResult>
 export async function savePanSouBaseUrlAction(baseURL: string): Promise<PushSettingsActionResult> {
   assertNotDemo();
   try {
+    // 探活是服务端向调用者给的任意地址发请求（issue #366 SSRF）。这个设置影响
+    // 整个实例的资源搜索走向，属于站主级配置：多用户下非站主账号不得写。单用户
+    // (含匿名访客) 走 resolveCurrentIsOwner 的既有判定（哨兵账号非站主，一律拒绝）。
+    const { resolveCurrentIsOwner } = await import("../lib/settings-attention-server");
+    if (!(await resolveCurrentIsOwner())) {
+      return { success: false, message: "只有站主可以修改网盘搜索源。" };
+    }
     const { getWorkflowRepository, getCurrentAccountId, PANSOU_BASE_URL_SETTING_KEY, PANSOU_HEALTH_SETTING_KEY } = await import("../lib/workflow-runtime");
     const repository = getWorkflowRepository();
     const accountId = await getCurrentAccountId();
@@ -710,6 +859,166 @@ export async function clearProwlarrConfigAction(): Promise<PushSettingsActionRes
     return { success: true };
   } catch (error) {
     return { success: false, message: `清除失败：${String(error)}` };
+  }
+}
+
+/** 海搜官方 API（idatariver 项目 b9d1）。保存前先真打一次搜索，把
+ *  「key 无效 / 没余额」在保存这一刻就告诉用户 —— 否则它会一路静默成
+ *  「这个源没结果」，用户永远查不到原因。 */
+export async function saveHaisouConfigAction(input: {
+  apiKey: string;
+}): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  const apiKey = input.apiKey.trim();
+  if (!apiKey) {
+    return { success: false, message: "请填入 API Key" };
+  }
+  try {
+    const { HaisouResourceProvider } = await import("@media-track/workflow");
+    const probe = new HaisouResourceProvider({ apiKey });
+    const snapshot = await probe.search({ keyword: "沙丘" });
+    if (snapshot.sourceHealth && snapshot.sourceHealth.status !== "healthy") {
+      return { success: false, message: "API Key 无效或额度不足（上游返回失败码）" };
+    }
+    const { getWorkflowRepository, getCurrentAccountId, HAISOU_API_KEY_SETTING_KEY } = await import(
+      "../lib/workflow-runtime"
+    );
+    await getWorkflowRepository().setAccountSetting(await getCurrentAccountId(), HAISOU_API_KEY_SETTING_KEY, apiKey);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function clearHaisouConfigAction(): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, getCurrentAccountId, HAISOU_API_KEY_SETTING_KEY } = await import(
+      "../lib/workflow-runtime"
+    );
+    await getWorkflowRepository().setAccountSetting(await getCurrentAccountId(), HAISOU_API_KEY_SETTING_KEY, "");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `清除失败：${String(error)}` };
+  }
+}
+
+export async function saveJevConfigAction(input: {
+  apiKey: string;
+  baseUrl: string;
+}): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const {
+      getWorkflowRepository,
+      getCurrentAccountId,
+      getAccountScopedSettings,
+      getJevConfig,
+      getJevInheritedBaseUrl,
+      JEV_API_KEY_SETTING_KEY,
+      JEV_BASE_URL_SETTING_KEY,
+      JEV_HEALTH_SETTING_KEY,
+      JEV_PREFILTER_ENABLED_SETTING_KEY,
+      JEV_PROBED_FOR_SETTING_KEY,
+      jevConfigFingerprint,
+      JEV_MODEL_SETTING_KEY,
+    } = await import("../lib/workflow-runtime");
+    const { probeJev, validateJevBaseUrlFormat } = await import("../lib/jev-probe");
+    const repository = getWorkflowRepository();
+    const accountId = await getCurrentAccountId();
+    // 留空 = 沿用当前**生效**的配置(account → 全局 → env) —— 与表单上「已设置」
+    // 占位符同一条规则。只读 account 行的话,一个存在于全局作用域或 env 的 key
+    // 会在这里被判成「没有 key」;而 enabled/health 只有这个 action 会写,于是
+    // 纯 env 部署永远激活不了。
+    const scoped = getAccountScopedSettings(accountId, repository);
+    const effective = await getJevConfig(scoped);
+    const typedKey = input.apiKey.trim();
+    const apiKey = typedKey || effective.apiKey || "";
+    if (!apiKey) return { success: false, message: "需要 Jev API Key（OpenRouter 的 sk-or-… 或 TypeSafe 官方控制台的 Key 都可以）。" };
+    const typedUrl = input.baseUrl.trim();
+    // 自定义地址只配**本账号自己的** Key。key 可能继承自实例(全局行或 env):允许
+    // 「只改地址」,等于让任一账号把共享 Key 发到它自己挑的服务器——探活发一次,之后
+    // 每次搜索都发(多用户)。读取端(getJevConfig)对这种状态同样视为未测、零调用。
+    const ownKey = typedKey || (await repository.getAccountSetting(accountId, JEV_API_KEY_SETTING_KEY))?.trim() || "";
+    if (typedUrl && !ownKey) {
+      return {
+        success: false,
+        message:
+          "自定义 Base URL 需要同时填你自己的 Key：当前用的是实例共享的 Jev Key，它只会发往实例配置的地址。清空 Base URL，或填上你自己的 Key 再保存。未保存。",
+      };
+    }
+    // 留空的 URL 会存成 ""(=去掉 account 覆盖),保存后真正生效的是 全局 → env → 默认。
+    // 探活必须打**那个**地址:沿用 effective.baseUrl 会打到即将被清掉的旧覆盖,
+    // 于是一个从没测过的端点被记成 healthy + enabled。
+    const baseUrl = typedUrl || (await getJevInheritedBaseUrl(repository));
+    // 先跑便宜的格式校验:漏写 scheme 的地址否则要耗满 8s 探活,再换回一句
+    // 含糊的「连不上」,而真正的问题是格式(与 PanSou 同一条规则)。只校验用户这次
+    // 输入的地址:继承来的(全局/env)是运营方的配置,不拿 http 规则去拦它。
+    if (typedUrl) {
+      const format = validateJevBaseUrlFormat(typedUrl);
+      if (!format.ok) return { success: false, message: format.message };
+    }
+    // 存之前真打一次:一个打不通的 key 被保存后,预筛会在每次搜索上静默 fail-open,
+    // 用户以为开了其实从没生效 —— 与 PanSou 自建源「活了 6 天」是同一种病。
+    const probe = await probeJev({ apiKey, baseUrl });
+    if (!probe.ok) return { success: false, message: probe.message };
+    // 只写用户**这次真输入**的内容:留空的 key 不重写(全局/env 的 key 不会被
+    // 复制进 account 行),留空的 URL 写 ""=无覆盖(同 Prowlarr),否则今天的默认
+    // 端点会被冻进 DB,日后改 env JEV_BASE_URL 也推不动它。
+    if (typedKey) await repository.setAccountSetting(accountId, JEV_API_KEY_SETTING_KEY, typedKey);
+    await repository.setAccountSetting(accountId, JEV_BASE_URL_SETTING_KEY, typedUrl);
+    await repository.setAccountSetting(accountId, JEV_HEALTH_SETTING_KEY, "ok");
+    // 记下这次探活的是哪套 key/URL:之后 env 换了 key 或端点挪了,读取端就把 "ok"
+    // 当成未测(见 getJevConfig),而不是顶着旧结论让每次搜索静默 fail-open。
+    await repository.setAccountSetting(accountId, JEV_PROBED_FOR_SETTING_KEY, jevConfigFingerprint(apiKey, baseUrl));
+    await repository.setAccountSetting(accountId, JEV_MODEL_SETTING_KEY, probe.model);
+    await repository.setAccountSetting(accountId, JEV_PREFILTER_ENABLED_SETTING_KEY, "1");
+    return { success: true, message: `已连通（${probe.model}）` };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function clearJevConfigAction(): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const {
+      getWorkflowRepository,
+      getCurrentAccountId,
+      JEV_API_KEY_SETTING_KEY,
+      JEV_BASE_URL_SETTING_KEY,
+      JEV_HEALTH_SETTING_KEY,
+      JEV_PREFILTER_ENABLED_SETTING_KEY,
+      JEV_PROBED_FOR_SETTING_KEY,
+      JEV_MODEL_SETTING_KEY,
+    } = await import("../lib/workflow-runtime");
+    const repository = getWorkflowRepository();
+    const accountId = await getCurrentAccountId();
+    for (const key of [JEV_API_KEY_SETTING_KEY, JEV_BASE_URL_SETTING_KEY, JEV_HEALTH_SETTING_KEY, JEV_PROBED_FOR_SETTING_KEY, JEV_MODEL_SETTING_KEY]) {
+      await repository.setAccountSetting(accountId, key, "");
+    }
+    // A blank account row means "inherit" (account → global): blanking `enabled` too
+    // would hand this account back to an instance-wide config that the worker keeps
+    // using while the form says 未配置. 清除 means this account's prefilter is off.
+    await repository.setAccountSetting(accountId, JEV_PREFILTER_ENABLED_SETTING_KEY, "0");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `清除失败：${String(error)}` };
+  }
+}
+
+export async function setJevPrefilterEnabledAction(enabled: boolean): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, getCurrentAccountId, JEV_PREFILTER_ENABLED_SETTING_KEY } = await import(
+      "../lib/workflow-runtime"
+    );
+    const repository = getWorkflowRepository();
+    const accountId = await getCurrentAccountId();
+    await repository.setAccountSetting(accountId, JEV_PREFILTER_ENABLED_SETTING_KEY, enabled ? "1" : "0");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
   }
 }
 
@@ -850,11 +1159,467 @@ export async function testRemoteAccessConnectionAction(): Promise<TestRemoteAcce
   // demo gate:与其它 settings action 一致(Copilot round 1)。
   // demo 站没有真实隧道,探测只会做无意义的跨网请求。
   assertNotDemo();
-  const { instanceConnectHostname } = await import("../lib/remote-access");
-  const hostname = instanceConnectHostname();
+  const { resolveInstanceConnectHostname } = await import("../lib/remote-access");
+  const hostname = await resolveInstanceConnectHostname();
   if (hostname === null) {
     return { ok: false, detail: "no_hostname" };
   }
   const { probeRemoteAccess } = await import("../lib/remote-access-probe");
   return await probeRemoteAccess(hostname);
 }
+
+// ── Agent memory (work detail page + Settings → AI 模型) ──────────────────────
+// Writes use requireAuthenticatedAccountId (like unbindStorageAction): an anonymous
+// remote caller resolves to the shared acct_unauthenticated sentinel, and must not be
+// able to change memory state for it. The throw lands in each action's catch → a
+// failed result, nothing written.
+type MemoryAddressInput = import("../lib/agent-memory-server").MemoryAddress;
+
+export async function setAgentMemoryEnabledAction(enabled: boolean): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const { AGENT_MEMORY_ENABLED_SETTING_KEY } = await import("../lib/agent-memory-server");
+    await getWorkflowRepository().setAccountSetting(await requireAuthenticatedAccountId(), AGENT_MEMORY_ENABLED_SETTING_KEY, enabled ? "1" : "0");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function deleteAgentMemoryAction(address: MemoryAddressInput, name: string): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const { deleteMemoryFromUi } = await import("../lib/agent-memory-server");
+    const result = await deleteMemoryFromUi(getWorkflowRepository(), await requireAuthenticatedAccountId(), address, name);
+    return result.success ? { success: true } : { success: false, message: result.message };
+  } catch (error) {
+    return { success: false, message: `删除没成功：${String(error)}` };
+  }
+}
+
+// ── User messages (work detail page) ─────────────────────────────────────────
+// One sentence asking the agent to replace bad episodes, or a bad film. Same guards and
+// result shape as the memory actions; the card refreshes the page itself afterwards, as
+// the notes panel does. The work-level actions file under resolveMessageWork's work,
+// the key the engine looks up — never a key derived from the page's storageId alone.
+const MESSAGE_NOT_TRACKED = "这部作品没有在这块网盘上追踪";
+const MESSAGE_ALREADY_TAKEN = "agent 已经开始处理这条留言了";
+
+interface MessageWorkInput {
+  tmdbId: number;
+  mediaType: "movie" | "tv";
+  // The page's workspace drive (undefined = primary), as for requestSeasonAction.
+  storageId: string | undefined;
+}
+
+/** The caller's work for this title on the page's drive (null when it is not tracked
+ *  there), and the page's workspace scope. Throws for an unauthenticated caller (→ the
+ *  action's catch). */
+async function messageWorkFor(input: MessageWorkInput) {
+  const { getActiveWorkspaceScope, getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+  const { resolveMessageWorksWithStates } = await import("../lib/user-message-server");
+  await requireAuthenticatedAccountId();
+  const repo = getWorkflowRepository();
+  const scope = await getActiveWorkspaceScope(input.storageId);
+  const { works, states } = await resolveMessageWorksWithStates({ repo, scope, tmdbId: input.tmdbId, mediaType: input.mediaType });
+  return { repo, scope, work: works[0] ?? null, works, states };
+}
+
+/** The message as it will be stored (body trimmed), checked before any lookup: the
+ *  length limit applies to what is saved, and a bad message never costs a DB read.
+ *  Null message = valid. */
+async function checkMessageInput(input: { body: string; episodeTags: string[] }) {
+  const { validateUserMessageInput } = await import("@media-track/workflow");
+  // Whatever the client sent: only a string is trimmed, anything else goes to the validator as is.
+  const body = typeof input.body === "string" ? input.body.trim() : input.body;
+  return { body, message: validateUserMessageInput({ body, episodeTags: input.episodeTags }) };
+}
+
+export async function postUserMessageAction(
+  input: MessageWorkInput & { body: string; episodeTags: string[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const checked = await checkMessageInput(input);
+    if (checked.message) return { success: false, message: checked.message };
+    const { repo, scope, work, works, states } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    const { pickWorkForMessage } = await import("../lib/user-message-server");
+    const targetWork = (await pickWorkForMessage({ repo, scope, works, states, episodeTags: input.episodeTags })) ?? work;
+    await repo.createUserMessage({ ...targetWork, body: checked.body, episodeTags: input.episodeTags, now: new Date().toISOString() });
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `留言没发出去：${String(error)}` };
+  }
+}
+
+/** Only while the message waits; once a run holds it the store refuses. */
+export async function editUserMessageAction(input: { id: string; body: string; episodeTags: string[] }): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const checked = await checkMessageInput(input);
+    if (checked.message) return { success: false, message: checked.message };
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const accountId = await requireAuthenticatedAccountId();
+    const edited = await getWorkflowRepository().editUserMessage({
+      accountId,
+      id: input.id,
+      body: checked.body,
+      episodeTags: input.episodeTags,
+      now: new Date().toISOString(),
+    });
+    return edited ? { success: true } : { success: false, message: MESSAGE_ALREADY_TAKEN };
+  } catch (error) {
+    return { success: false, message: `修改没成功：${String(error)}` };
+  }
+}
+
+export async function withdrawUserMessageAction(input: { id: string }): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const accountId = await requireAuthenticatedAccountId();
+    const withdrawn = await getWorkflowRepository().withdrawUserMessage({ accountId, id: input.id, now: new Date().toISOString() });
+    return withdrawn ? { success: true } : { success: false, message: MESSAGE_ALREADY_TAKEN };
+  } catch (error) {
+    return { success: false, message: `撤回没成功：${String(error)}` };
+  }
+}
+
+/** What 「现在处理」 did. "queued": a replace run is queued for the work's waiting
+ *  messages. "already_running": a run of this work is already queued or running — a
+ *  queued replace run takes the messages along when it starts, otherwise they go right
+ *  after the run in flight (the idle-queue scan), so the card says 「排队中 · 这次处理完
+ *  接着处理」. "nothing_waiting": claimed or withdrawn since the page loaded. */
+export type ProcessMessagesNowStatus = "queued" | "already_running" | "nothing_waiting";
+
+/** 「现在处理」: the work's waiting messages skip the patrol. */
+export async function processMessagesNowAction(
+  input: MessageWorkInput,
+): Promise<PushSettingsActionResult & { status?: ProcessMessagesNowStatus }> {
+  assertNotDemo();
+  try {
+    const { repo, work, works } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    // Like every acquire entry point: never queue a run that can only fail in the worker.
+    const preflight = await acquireLlmNotConfigured();
+    if (preflight) return { success: false, message: preflight.message };
+    const [storages, messageLists] = await Promise.all([
+      repo.listConnectedStorages(work.accountId),
+      Promise.all(works.map((candidateWork) => repo.listUserMessages(candidateWork))),
+    ]);
+    const worksWithPending = works.filter((_, index) =>
+      messageLists[index]?.some((m) => m.status === "pending"),
+    );
+    const checkWorks = worksWithPending.length > 0 ? worksWithPending : [work];
+    for (const candidateWork of checkWorks) {
+      const drive = storages.find((s) => s.id === candidateWork.drive);
+      if (drive?.status === "frozen") return { success: false, message: "这块网盘登录已失效，重新绑定后再处理" };
+    }
+    const { queueReplaceRequest } = await import("@media-track/workflow");
+    const nowIso = new Date().toISOString();
+    const markedCounts = await Promise.all(
+      checkWorks.map((candidateWork) => repo.markUserMessagesUrgent({ ...candidateWork, now: nowIso })),
+    );
+    const targetWorks = checkWorks.filter((_, index) => (markedCounts[index] ?? 0) > 0);
+    if (targetWorks.length === 0) {
+      return { success: true, status: "nothing_waiting" };
+    }
+    const results = await Promise.all(
+      targetWorks.map((targetWork) => queueReplaceRequest({ repository: repo, work: targetWork, origin: "user" })),
+    );
+    if (results.every((r) => r.status === "not_tracked")) {
+      return { success: false, message: MESSAGE_NOT_TRACKED };
+    }
+    const status = results.some((r) => r.status === "queued") ? "queued" : "already_running";
+    return { success: true, status };
+  } catch (error) {
+    return { success: false, message: `没能开始处理：${String(error)}` };
+  }
+}
+
+/** 「不换了」: these episodes stay as they are; the patrol stops looking for them. Saved at
+ *  once — the card's 撤销 calls restoreEpisodesToPendingAction. Refused while a replace run
+ *  of the work is processing, as the card's button is — checked again here, since the page
+ *  may not have seen the run start. */
+export async function keepEpisodesAsIsAction(
+  input: MessageWorkInput & { episodes: string[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { USER_MESSAGE_LIMITS } = await import("@media-track/workflow");
+    const { repo, scope, work, works } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    const { episodes } = input;
+    if (!Array.isArray(episodes) || episodes.length > USER_MESSAGE_LIMITS.tagsMax || episodes.some((e) => typeof e !== "string")) {
+      return { success: false, message: "集数不对" };
+    }
+    const { keepMustWait } = await import("../lib/user-message-server");
+    if (await keepMustWait({ repo, scope, work, works })) {
+      const { KEEP_BUSY_HINT } = await import("../lib/user-message-state");
+      return { success: false, message: KEEP_BUSY_HINT };
+    }
+    await Promise.all(works.map((w) => repo.removePendingReplacements({ ...w, episodes })));
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `没能保存：${String(error)}` };
+  }
+}
+
+/** A 待换 row as the card got it (loadMessageThread): what 撤销 puts back. */
+export interface PendingEpisodeInput {
+  episode: string;
+  messageId: string;
+  requestedAt: string;
+}
+
+/** 撤销 after 「不换了」: the 待换 rows go back exactly as they were (the message that asked,
+ *  and when), so the patrol looks for these episodes again. A row that is somehow still
+ *  there is left alone. Only rows this work's own 待换 could have held are taken — its own
+ *  messages, its own episodes, no future time — and one that is not refuses the whole call. */
+export async function restoreEpisodesToPendingAction(
+  input: MessageWorkInput & { episodes: PendingEpisodeInput[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { USER_MESSAGE_LIMITS } = await import("@media-track/workflow");
+    const { parsePendingRows, pendingRowsFitWork } = await import("../lib/user-message-server");
+    const rows = parsePendingRows(input.episodes, input.mediaType, USER_MESSAGE_LIMITS.tagsMax);
+    if (!rows) return { success: false, message: "集数不对" };
+    const { repo, scope, work, works, states } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    const workByMessageId = new Map<string, typeof work>();
+    if (!(await pendingRowsFitWork({ repo, scope, work, works, states, workByMessageId, mediaType: input.mediaType, rows, now: new Date() }))) {
+      return { success: false, message: "要恢复的集对不上这部作品" };
+    }
+    // addPendingReplacements takes one message and one time per call.
+    const groups = new Map<string, { targetWork: typeof work; messageId: string; requestedAt: string; episodes: string[] }>();
+    for (const row of rows) {
+      const targetWork = workByMessageId.get(row.messageId) ?? work;
+      const key = `${targetWork.drive} ${row.messageId} ${row.requestedAt}`;
+      const group = groups.get(key) ?? { targetWork, messageId: row.messageId, requestedAt: row.requestedAt, episodes: [] };
+      group.episodes.push(row.episode);
+      groups.set(key, group);
+    }
+    await Promise.all(
+      [...groups.values()].map((group) =>
+        repo.addPendingReplacements({
+          ...group.targetWork,
+          episodes: group.episodes,
+          messageId: group.messageId,
+          now: group.requestedAt,
+        }),
+      ),
+    );
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `没能撤销：${String(error)}` };
+  }
+}
+
+export interface MediaServerFormInput {
+  embyUrl?: string;
+  embyApiKey?: string;
+  jellyfinUrl?: string;
+  jellyfinApiKey?: string;
+  plexUrl?: string;
+  plexToken?: string;
+  webhookUrl?: string;
+  delaySeconds?: number;
+}
+
+export async function saveMediaServerSettingsAction(
+  input: MediaServerFormInput,
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { resolveCurrentIsOwner } = await import("../lib/settings-attention-server");
+    if (!(await resolveCurrentIsOwner())) {
+      return { success: false, message: "只有站主可以配置媒体服务器刷新。" };
+    }
+    const {
+      MEDIA_SERVER_SETTING_KEYS,
+      MAX_MEDIA_SERVER_DELAY_SECONDS,
+      parseMediaServerDelaySeconds,
+      validateMediaServerUrl,
+    } = await import("@media-track/workflow");
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const repository = getWorkflowRepository();
+    const accountId = await requireAuthenticatedAccountId();
+
+    const urlEntries: Array<[string | undefined, string, string, boolean]> = [
+      [input.embyUrl, MEDIA_SERVER_SETTING_KEYS.embyUrl, "Emby 地址", false],
+      [input.jellyfinUrl, MEDIA_SERVER_SETTING_KEYS.jellyfinUrl, "Jellyfin 地址", false],
+      [input.plexUrl, MEDIA_SERVER_SETTING_KEYS.plexUrl, "Plex 地址", false],
+    ];
+    const normalizedUrls: Array<[string, string]> = [];
+    for (const [raw, settingKey, label, allowQuery] of urlEntries) {
+      if (raw === undefined) continue;
+      const trimmed = raw.trim();
+      if (!trimmed) {
+        normalizedUrls.push([settingKey, ""]);
+        continue;
+      }
+      const checked = validateMediaServerUrl(trimmed, { allowQuery });
+      if (!checked.ok) {
+        return { success: false, message: `${label}：${checked.message}` };
+      }
+      normalizedUrls.push([settingKey, checked.url]);
+    }
+
+    const typedWebhook = input.webhookUrl?.trim();
+    if (typedWebhook) {
+      const checked = validateMediaServerUrl(typedWebhook, { allowQuery: true });
+      if (!checked.ok) {
+        return { success: false, message: `入库 Webhook：${checked.message}` };
+      }
+    }
+
+    // Check completeness when a server URL is provided without an existing or newly typed secret
+    const checkPair = async (
+      nextUrl: string | undefined,
+      typedSecret: string | undefined,
+      secretKey: string,
+      serverLabel: string,
+    ): Promise<string | null> => {
+      if (nextUrl === undefined) return null;
+      const cleanUrl = nextUrl.trim();
+      if (!cleanUrl) return null;
+      if (typedSecret?.trim()) return null;
+      const existingSecret = (await repository.getAccountSetting(accountId, secretKey))?.trim();
+      if (!existingSecret) {
+        return `${serverLabel} 需要同时填写密钥 / Token`;
+      }
+      return null;
+    };
+
+    const pairError =
+      (await checkPair(input.embyUrl, input.embyApiKey, MEDIA_SERVER_SETTING_KEYS.embyApiKey, "Emby")) ??
+      (await checkPair(input.jellyfinUrl, input.jellyfinApiKey, MEDIA_SERVER_SETTING_KEYS.jellyfinApiKey, "Jellyfin")) ??
+      (await checkPair(input.plexUrl, input.plexToken, MEDIA_SERVER_SETTING_KEYS.plexToken, "Plex"));
+    if (pairError) {
+      return { success: false, message: pairError };
+    }
+
+    if (
+      input.delaySeconds !== undefined &&
+      (!Number.isFinite(input.delaySeconds) ||
+        input.delaySeconds < 0 ||
+        input.delaySeconds > MAX_MEDIA_SERVER_DELAY_SECONDS)
+    ) {
+      return { success: false, message: `刷新延迟需在 0 到 ${MAX_MEDIA_SERVER_DELAY_SECONDS} 秒之间` };
+    }
+
+    for (const [settingKey, val] of normalizedUrls) {
+      await repository.setAccountSetting(accountId, settingKey, val);
+    }
+    if (input.embyUrl !== undefined && !input.embyUrl.trim()) {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.embyApiKey, "");
+    } else if (input.embyApiKey?.trim()) {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.embyApiKey, input.embyApiKey.trim());
+    }
+    if (input.jellyfinUrl !== undefined && !input.jellyfinUrl.trim()) {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.jellyfinApiKey, "");
+    } else if (input.jellyfinApiKey?.trim()) {
+      await repository.setAccountSetting(
+        accountId,
+        MEDIA_SERVER_SETTING_KEYS.jellyfinApiKey,
+        input.jellyfinApiKey.trim(),
+      );
+    }
+    if (input.plexUrl !== undefined && !input.plexUrl.trim()) {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.plexToken, "");
+    } else if (input.plexToken?.trim()) {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.plexToken, input.plexToken.trim());
+    }
+    if (typedWebhook) {
+      const checked = validateMediaServerUrl(typedWebhook, { allowQuery: true });
+      if (checked.ok) {
+        await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.webhookUrl, checked.url);
+      }
+    }
+    if (input.delaySeconds !== undefined) {
+      const sec = parseMediaServerDelaySeconds(String(input.delaySeconds));
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.delaySeconds, String(sec));
+    }
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function clearMediaServerChannelAction(
+  channel: string,
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { resolveCurrentIsOwner } = await import("../lib/settings-attention-server");
+    if (!(await resolveCurrentIsOwner())) {
+      return { success: false, message: "只有站主可以配置媒体服务器刷新。" };
+    }
+    const { MEDIA_SERVER_CHANNEL_KEYS, MEDIA_SERVER_SETTING_KEYS } = await import("@media-track/workflow");
+    if (!(MEDIA_SERVER_CHANNEL_KEYS as readonly string[]).includes(channel)) {
+      return { success: false, message: "未知的媒体服务器类型" };
+    }
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const repository = getWorkflowRepository();
+    const accountId = await requireAuthenticatedAccountId();
+
+    if (channel === "emby") {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.embyUrl, "");
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.embyApiKey, "");
+    } else if (channel === "jellyfin") {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.jellyfinUrl, "");
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.jellyfinApiKey, "");
+    } else if (channel === "plex") {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.plexUrl, "");
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.plexToken, "");
+    } else if (channel === "webhook") {
+      await repository.setAccountSetting(accountId, MEDIA_SERVER_SETTING_KEYS.webhookUrl, "");
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `清除失败：${String(error)}` };
+  }
+}
+
+export async function testMediaServerRefreshAction(
+  draft?: MediaServerFormInput,
+): Promise<PushSettingsActionResult & { refreshed?: string[] }> {
+  assertNotDemo();
+  try {
+    const { resolveCurrentIsOwner } = await import("../lib/settings-attention-server");
+    if (!(await resolveCurrentIsOwner())) {
+      return { success: false, message: "只有站主可以测试媒体服务器刷新。" };
+    }
+    const { refreshConfiguredMediaServers } = await import("@media-track/workflow");
+    const { getAccountScopedSettings, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const accountId = await requireAuthenticatedAccountId();
+    const scoped = getAccountScopedSettings(accountId);
+    const summary = await refreshConfiguredMediaServers({
+      repository: scoped,
+      items: [{ titleName: "巡影测试入库刷新", mediaType: "movie", year: 2026 }],
+      test: true,
+      delayMs: 0,
+      ...(draft ? { overrides: draft } : {}),
+    });
+    if (summary.refreshed.length === 0 && summary.failures.length === 0) {
+      return { success: false, message: "尚未配置任何媒体服务器或入库 Webhook" };
+    }
+    if (summary.failures.length > 0) {
+      const detail = summary.failures.map((f) => `${f.server}（${f.error}）`).join("；");
+      return {
+        success: false,
+        message: `刷新失败：${detail}`,
+        ...(summary.refreshed.length > 0 ? { refreshed: summary.refreshed } : {}),
+      };
+    }
+    return { success: true, refreshed: summary.refreshed };
+  } catch (error) {
+    return { success: false, message: `测试失败：${String(error)}` };
+  }
+}
+

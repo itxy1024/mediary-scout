@@ -14,10 +14,6 @@ import {
 } from "./media-library-folder.js";
 import type { StorageExecutor } from "./ports.js";
 import type { WorkflowRepository } from "./repository.js";
-import {
-  createManualSelectionEvidence,
-  type ManualResourceSelection,
-} from "./manual-resource-selection.js";
 
 export type TrackingInitializationRequestStatus = "already_running" | "already_tracked" | "queued" | "completed";
 
@@ -51,35 +47,17 @@ export async function queueTrackingInitialization(input: {
   createWorkflowRunId?: () => string;
   now?: () => string;
   staleActiveRunTimeoutMs?: number;
-  /** 用户在候选页明确选择的唯一资源；存在时后台不得改选其他候选。 */
-  manualSelection?: ManualResourceSelection;
 }): Promise<TrackingInitializationRequestResult> {
   const now = input.now ?? (() => new Date().toISOString());
   const workflowRunId = input.createWorkflowRunId?.() ?? crypto.randomUUID();
   const queuedAt = now();
   const staleActiveRunStartedBefore = staleStartedBefore(queuedAt, input.staleActiveRunTimeoutMs);
-  const existingState = input.manualSelection
-    ? await input.repository.getTrackedSeasonState(input.season.id, {
-        accountId: input.accountId ?? "acct_default",
-        connectedStorageId: input.connectedStorageId ?? null,
-      })
-    : null;
-  const initialEpisodes =
-    existingState?.episodes ??
-    createEpisodeStates({
-      trackedSeasonId: input.season.id,
-      seasonNumber: input.season.seasonNumber,
-      totalEpisodes: input.season.totalEpisodes,
-      latestAiredEpisode: input.season.latestAiredEpisode,
-    });
-  const manualEvidence = input.manualSelection
-    ? createManualSelectionEvidence({
-        workflowRunId,
-        keyword: input.keyword,
-        selection: input.manualSelection,
-        now: queuedAt,
-      })
-    : null;
+  const initialEpisodes = createEpisodeStates({
+    trackedSeasonId: input.season.id,
+    seasonNumber: input.season.seasonNumber,
+    totalEpisodes: input.season.totalEpisodes,
+    latestAiredEpisode: input.season.latestAiredEpisode,
+  });
 
   const reservation = await input.repository.reserveWorkflowRun({
     ...(input.accountId ? { accountId: input.accountId } : {}),
@@ -103,15 +81,14 @@ export async function queueTrackingInitialization(input: {
           message: `Queued tracking initialization workflow ${workflowRunId}`,
           data: { keyword: input.keyword },
         },
-        ...(manualEvidence ? [manualEvidence.auditEvent] : []),
       ],
     },
     episodes: initialEpisodes,
-    resourceSnapshots: manualEvidence ? [manualEvidence.snapshot] : [],
+    resourceSnapshots: [],
     decisions: [],
     transferAttempts: [],
     notifications: [],
-    blockIfEpisodeStatesExist: input.manualSelection ? false : true,
+    blockIfEpisodeStatesExist: true,
     blockIfTitleHasActiveRun: true,
     ...(staleActiveRunStartedBefore
       ? {
@@ -209,8 +186,6 @@ export async function queueSeriesInitialization(input: {
   createWorkflowRunId?: () => string;
   now?: () => string;
   staleActiveRunTimeoutMs?: number;
-  /** 用户在候选页明确选择的唯一资源；存在时后台不得改选其他候选。 */
-  manualSelection?: ManualResourceSelection;
 }): Promise<SeriesInitializationRequestResult> {
   const now = input.now ?? (() => new Date().toISOString());
   const workflowRunId = input.createWorkflowRunId?.() ?? crypto.randomUUID();
@@ -224,27 +199,17 @@ export async function queueSeriesInitialization(input: {
     id: `${input.title.id}_s${firstSeason.seasonNumber}`,
     mediaTitleId: input.title.id,
     seasonNumber: firstSeason.seasonNumber,
-    status: firstSeason.latestAiredEpisode >= firstSeason.totalEpisodes ? "completed" : "active",
+    // Enqueue-time lock row: nothing obtained yet → "active" even for a 完结
+    // series. The bridge grades it "completed" only once fully obtained; grading
+    // it completed on airing alone would leave a failed/pre-bridge run stuck
+    // completed-with-gaps and the patrol would skip it forever.
+    status: "active",
     qualityPreference: "4K",
     storageDirectoryId: "",
     totalEpisodes: firstSeason.totalEpisodes,
     latestAiredEpisode: firstSeason.latestAiredEpisode,
     latestAiredSource: "metadata",
   };
-  const existingLockState = input.manualSelection
-    ? await input.repository.getTrackedSeasonState(lockSeason.id, {
-        accountId: input.accountId ?? "acct_default",
-        connectedStorageId: input.connectedStorageId ?? null,
-      })
-    : null;
-  const manualEvidence = input.manualSelection
-    ? createManualSelectionEvidence({
-        workflowRunId,
-        keyword: input.keyword,
-        selection: input.manualSelection,
-        now: queuedAt,
-      })
-    : null;
 
   const reservation = await input.repository.reserveWorkflowRun({
     ...(input.accountId ? { accountId: input.accountId } : {}),
@@ -264,15 +229,14 @@ export async function queueSeriesInitialization(input: {
           message: `Queued series initialization workflow ${workflowRunId}`,
           data: { keyword: input.keyword, seasons: input.seasons },
         },
-        ...(manualEvidence ? [manualEvidence.auditEvent] : []),
       ],
     },
-    episodes: existingLockState?.episodes ?? [],
-    resourceSnapshots: manualEvidence ? [manualEvidence.snapshot] : [],
+    episodes: [],
+    resourceSnapshots: [],
     decisions: [],
     transferAttempts: [],
     notifications: [],
-    blockIfEpisodeStatesExist: input.manualSelection ? false : true,
+    blockIfEpisodeStatesExist: true,
     blockIfTitleHasActiveRun: true,
     ...(staleActiveRunStartedBefore
       ? { staleActiveRunStartedBefore, staleFinishedAt: queuedAt }
@@ -313,8 +277,6 @@ export async function queueMovieAcquisition(input: {
   createWorkflowRunId?: () => string;
   now?: () => string;
   staleActiveRunTimeoutMs?: number;
-  /** 用户在候选页明确选择的唯一资源；存在时后台不得改选其他候选。 */
-  manualSelection?: ManualResourceSelection;
 }): Promise<MovieAcquisitionRequestResult> {
   const now = input.now ?? (() => new Date().toISOString());
   const workflowRunId = input.createWorkflowRunId?.() ?? crypto.randomUUID();
@@ -325,20 +287,6 @@ export async function queueMovieAcquisition(input: {
     qualityPreference: "4K",
     storageDirectoryId: "",
   });
-  const existingState = input.manualSelection
-    ? await input.repository.getTrackedSeasonState(season.id, {
-        accountId: input.accountId ?? "acct_default",
-        connectedStorageId: input.connectedStorageId ?? null,
-      })
-    : null;
-  const manualEvidence = input.manualSelection
-    ? createManualSelectionEvidence({
-        workflowRunId,
-        keyword: input.keyword,
-        selection: input.manualSelection,
-        now: queuedAt,
-      })
-    : null;
 
   const reservation = await input.repository.reserveWorkflowRun({
     ...(input.accountId ? { accountId: input.accountId } : {}),
@@ -358,15 +306,14 @@ export async function queueMovieAcquisition(input: {
           message: `Queued movie acquisition workflow ${workflowRunId}`,
           data: { keyword: input.keyword },
         },
-        ...(manualEvidence ? [manualEvidence.auditEvent] : []),
       ],
     },
-    episodes: existingState?.episodes ?? [],
-    resourceSnapshots: manualEvidence ? [manualEvidence.snapshot] : [],
+    episodes: [],
+    resourceSnapshots: [],
     decisions: [],
     transferAttempts: [],
     notifications: [],
-    blockIfEpisodeStatesExist: input.manualSelection ? false : true,
+    blockIfEpisodeStatesExist: true,
     blockIfTitleHasActiveRun: true,
     ...(staleActiveRunStartedBefore
       ? { staleActiveRunStartedBefore, staleFinishedAt: queuedAt }

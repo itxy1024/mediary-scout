@@ -1,8 +1,8 @@
 "use client";
 
-import { CalendarClock, Check, ListChecks, LoaderCircle, Plus } from "lucide-react";
+import { CalendarClock, Check, LoaderCircle, Plus } from "lucide-react";
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "../lib/use-router";
 import { requestTrackingAction, type RequestTrackingActionResult } from "../app/actions";
 import { runAction } from "../lib/run-action";
 // Import the type from the narrow subpath, NOT the root barrel: the barrel
@@ -17,7 +17,6 @@ import { isDemoModeClient } from "../lib/demo-mode";
 import { DemoAcquirePlayback } from "./demo-acquire-playback";
 import type { DemoAcquisitionEntry } from "../lib/demo-session";
 import { useDemoAcquiredTmdbIds } from "../lib/use-demo-session";
-import { resourcePickerHref } from "../lib/resource-picker-link";
 
 /**
  * Acquire control for a movie candidate. Visual states, kept consistent with
@@ -160,20 +159,6 @@ export function RequestTrackButton({
         )}
         {isPending ? (actionState === "can_reserve" ? "预定中" : "请求中") : label}
       </button>
-      {actionState !== "can_reserve" && tmdbId != null ? (
-        <button
-          className="primary-button manual-acquire-button"
-          type="button"
-          title="打开资源列表，手动选择要保存的候选"
-          disabled={isPending}
-          onClick={() => {
-            router.push(resourcePickerHref({ kind: "movie", tmdbId, ...(storageId ? { storageId } : {}) }));
-          }}
-        >
-          <ListChecks size={15} aria-hidden />
-          手动获取
-        </button>
-      ) : null}
       {/* A non-queued result (e.g. unsupported / failed) fell through to the
           requestable button — surface its reason instead of swallowing it. */}
       {result ? <p className="request-result">{result.message}</p> : null}

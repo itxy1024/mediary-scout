@@ -1,11 +1,28 @@
-# media-track 自部署:直接拉取 web 成品镜像,并启动 Postgres / PanSou。
-#   docker compose up -d   →   打开 http://<host>:13000   →   设置页扫码连接网盘
-# web 与 PanSou 来自 ghcr.io;Postgres 与 cloudflared 来自 Docker Hub。
-# 中国大陆拉取 Docker Hub 失败时,请配置 Docker daemon 的 registry-mirrors;
-# .env 中的 DOCKER_MIRROR 仅供手动执行 docker build --build-arg 使用,
-# 不会改写本 Compose 文件里的 image 地址。
-
-name: mediary-scout
+# media-track 自部署:一把拉起 web(Next + 进程内 worker) / Postgres / PanSou。
+#   docker compose up -d   →   打开 http://<host>:3000   →   设置页扫码连 115 即用
+# TMDB 经 §1 CF Worker 开箱即用;LLM key / 自己的 TMDB key / Prowlarr 在设置页填。
+# ---- Docker Hub 镜像源(墙内必读) ----
+#
+# 本文件里四个镜像来自 Docker Hub:postgres、node(见 Dockerfile)、cloudflared、
+# updater 的 docker:27-cli(见 updater/Dockerfile)。
+# **在中国大陆,Docker Hub 经常拉不动** —— 表现为
+# `failed to fetch anonymous token: ... EOF` 或 `connection reset by peer`。
+# 这不是你的配置错了,是 registry-1.docker.io / auth.docker.io 不可达。
+#
+# 解决:在 .env 里设一个镜像源前缀,四处会一起生效:
+#
+#   DOCKER_MIRROR=docker.1ms.run
+#
+# 已实测可用(2026-08-01,大陆直连):
+#   docker.1ms.run  ·  dockerproxy.net  ·  docker.m.daocloud.io  ·  hub.rat.dev
+# 换一个不通就换下一个 —— 公共镜像站会轮流失效,别只记住一个。
+#
+# 留空(默认)= 直连 Docker Hub 官方,境外网络无需任何设置。
+# 注意 pansou 走的是 ghcr.io,**不受此变量影响**(ghcr 在墙内通常可直连)。
+#
+# build 阶段(Dockerfile 里的 node 基础镜像)要同一个值:
+#   docker compose build --build-arg DOCKER_MIRROR=docker.1ms.run web
+# 或者更省事:把 DOCKER_MIRROR 写进 .env,compose 会自动传给 build args。
 
 x-default-logging: &default-logging
   driver: json-file
@@ -15,7 +32,8 @@ x-default-logging: &default-logging
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # ${DOCKER_MIRROR:+...} 的写法:变量非空时才加前缀和斜杠,空则退化成官方镜像名。
+    image: ${DOCKER_MIRROR:+${DOCKER_MIRROR}/library/}postgres:16-alpine
     environment:
       POSTGRES_DB: mediatrack
       POSTGRES_USER: mediatrack
@@ -31,71 +49,140 @@ services:
     restart: unless-stopped
 
   pansou:
+    # From ghcr.io — a Docker Hub registry mirror does NOT cover this. If ghcr is
+    # blocked (mainland China), set PANSOU_IMAGE in .env to a ghcr mirror/proxy.
     image: ${PANSOU_IMAGE:-ghcr.io/fish2018/pansou-web:latest}
-    ports:
-      - "8890:80"
+    # Good channel/plugin defaults (115 + 网盘源 Telegram channels). WITHOUT this,
+    # a fresh pansou-web indexes only magnet channels and returns ZERO 115 shares —
+    # the agent then never sees the good 网盘 4K/REMUX resources. See the file header.
     env_file:
-      - path: deploy/pansou.channels.env
-        required: true
-      - path: .env
-        required: false
+      - deploy/pansou.channels.env
     logging: *default-logging
     restart: unless-stopped
 
   web:
-    image: ghcr.io/itxy1024/mediary-scout:latest
-    pull_policy: always
-
+    build:
+      context: .
+      args:
+        MEDIA_TRACK_ALLOWED_ORIGINS: ${MEDIA_TRACK_ALLOWED_ORIGINS:-}
+        # Per-commit build stamp (+ source-COPY cache-bust). scripts/deploy.sh sets
+        # GIT_SHA=$(git rev-parse HEAD); the Dockerfile stamps it into the image as
+        # BUILD_COMMIT so a deploy can verify the running container serves HEAD. An unset
+        # value defaults to "unknown". See Dockerfile / docs/deploy.md 升级.
+        GIT_SHA: ${GIT_SHA:-unknown}
+        # 与上面三个 image 共用同一个镜像源值,自动传进 Dockerfile ——
+        # 否则用户还得记得手敲 `--build-arg DOCKER_MIRROR=...`,而漏了它的表现是
+        # 「compose 拉 postgres 成功、build web 却卡在 node:22-slim」,很难联想到
+        # 是同一个原因。
+        DOCKER_MIRROR: ${DOCKER_MIRROR:-}
     depends_on:
       postgres:
         condition: service_healthy
       pansou:
         condition: service_started
-
     environment:
+      # App self-creates its schema on first query (CREATE TABLE IF NOT EXISTS).
       MEDIA_TRACK_POSTGRES_URL: postgres://mediatrack:mediatrack@postgres:5432/mediatrack
+      # Bundled PanSou via the compose service name (override per-instance in 设置).
       PANSOU_BASE_URL: http://pansou
       MEDIA_TRACK_SEARCH_PROVIDER: tmdb
       MEDIA_TRACK_WORKFLOW_ADAPTER: pansou
       MEDIA_TRACK_STORAGE_ADAPTER: "115"
+      # Live trio: pansou + 115 REQUIRE the vercel-ai agent (assertWorkflowAgentAdapterPolicy).
+      # "real" is not a valid value — it fails the policy and the worker can never drain the
+      # queue (获取 stuck "排队", category dirs never provisioned). Must be vercel-ai.
       MEDIA_TRACK_AGENT_ADAPTER: vercel-ai
       MEDIA_TRACK_DEMO_SEED: "0"
+      # 隧道 token 也给 web:设置页「远程访问」用它作实例身份，向 Mediary Connect
+      # 报到查状态(仅发 Bearer 头做存活探针,不回传任何端点信息)。不传的话已开通
+      # 的实例会把自己显示成「未开通」。cloudflared 那边同样需要它,两处读同一个
+      # .env 变量。未设时为空 → tab 显示未开通,这正是自建/未开通实例的正确状态。
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
-
+      # 可观测性:完整有序的 agent 逐步轨迹始终落 agent_steps 表(psql 即可复盘)。
+      # 额外把每一步打到 stdout(docker compose logs web)是 OPT-IN —— 它会把工具参数
+      # (搜索关键词 / 候选 id / 文件 id)写进容器日志与日志聚合器,默认不开。需要排障时
+      # 在 .env 里设 MEDIA_TRACK_AGENT_LOG=1 自行启用(env_file 已加载 .env)。
+    # Optional overrides (TMDB/115/LLM/Prowlarr/CID). Missing file is fine —
+    # everything has a default or is configured in the 设置 page.
     env_file:
       - path: .env
         required: false
-
+    # 更新令牌和状态。只读：web 不挂 Docker socket，socket 只给下面的 updater。
+    volumes:
+      - updater-state:/updater-state:ro
+    # Host port configurable (WEB_PORT) in case 3000 is taken on the host.
     ports:
-      - "${WEB_PORT:-13000}:3000"
-
+      - "${WEB_PORT:-3000}:3000"
+    # Probes /api/health, which reads the DB through the app's real query path —
+    # so `docker ps` shows "unhealthy" if the app can't reach postgres (e.g. the
+    # 2026-07-21 wedge), not just when the process dies. Runs inside the container
+    # against localhost (bypasses any Cloudflare Access). node:22-slim has global
+    # fetch and no curl/wget, so probe with node. r.ok is true only for 2xx.
     healthcheck:
       test:
         - CMD-SHELL
-        - >-
-          node -e
-          "fetch('http://127.0.0.1:3000/api/health')
-          .then(r=>process.exit(r.ok?0:1))
-          .catch(()=>process.exit(1))"
+        - node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 40s
-
     logging: *default-logging
     restart: unless-stopped
 
+  # 一键更新的执行者。只有它能操作 Docker；不映射任何端口，只在 compose 内网。
+  # 网页通过共享卷里的令牌让它「更新到某个发布标签」，其它什么都不做。
+  # 它不会更新自己：改了 updater/ 要手动 `docker compose up -d --build updater`。
+  updater:
+    build:
+      context: ./updater
+      args:
+        DOCKER_MIRROR: ${DOCKER_MIRROR:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/repo
+      - updater-state:/state
+    environment:
+      UPDATER_WEB_BASE: http://web:3000
+      # Only git (the release download) uses these; calls to the web stay direct. The web
+      # reads HTTP(S)_PROXY on its own, but the updater is a separate container that does not.
+      UPDATER_HTTPS_PROXY: ${HTTPS_PROXY:-}
+      UPDATER_HTTP_PROXY: ${HTTP_PROXY:-}
+    logging: *default-logging
+    restart: unless-stopped
+
+  # Optional public HTTPS via Cloudflare Tunnel (no public IP, no open ports).
+  # Off by default — only starts under `--profile tunnel`.
+  #   1. Create a tunnel in the Cloudflare Zero Trust dashboard, set its public
+  #      hostname's service URL to  http://web:3000  (the compose service name —
+  #      NOT localhost), and copy the connector token.
+  #   2. Put TUNNEL_TOKEN=<token> in .env  (compose reads .env for interpolation).
+  #   3. docker compose --profile tunnel up -d
+  #   4. ⚠️ Gate the hostname: open http://<host>:${WEB_PORT:-3000}/login on the LAN and set an access
+  #      password (the first one can only be set from the LAN; remote requests then require
+  #      login while the LAN stays open), or put Cloudflare Access in front.
+  #      See docs/deploy.md → 「必须有门禁」. Never expose the hostname unless at
+  #      least one of those two gates is in place.
+  # See docs/deploy.md → 「方式二:Cloudflare Tunnel」 for the full walkthrough.
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: ${DOCKER_MIRROR:+${DOCKER_MIRROR}/}cloudflare/cloudflared:latest
     command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+      # Connector transport. Unset/empty → "auto" (cloudflared's own default: prefers
+      # QUIC/UDP, nominally falls back to HTTP/2). We default to the literal "auto" not
+      # "" because cloudflared rejects an empty protocol value ("unknown protocol").
+      # On UDP-blocked/throttled networks auto often doesn't fall back cleanly (tunnel
+      # won't register or keeps dropping) — set TUNNEL_TRANSPORT_PROTOCOL=http2 in .env.
       TUNNEL_TRANSPORT_PROTOCOL: ${TUNNEL_TRANSPORT_PROTOCOL:-auto}
+    # Lets the connector resolve the Docker host, so a tunnel Public Hostname of
+    # type SSH can point at the host's sshd (host.docker.internal:22) — enabling
+    # SSH-over-tunnel from anywhere without opening a port. Harmless if unused.
+    # ⚠️ A bare SSH Public Hostname is reachable by anyone who knows it — gate it
+    # with Cloudflare Access, or accept key-only auth (no password auth on sshd).
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      web:
-        condition: service_healthy
+      - web
     logging: *default-logging
     restart: unless-stopped
     profiles:
@@ -103,3 +190,4 @@ services:
 
 volumes:
   pgdata:
+  updater-state:

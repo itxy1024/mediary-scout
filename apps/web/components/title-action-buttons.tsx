@@ -1,15 +1,20 @@
 "use client";
 
-import { Check, DownloadCloud, Layers, ListChecks, LoaderCircle } from "lucide-react";
+import { Check, DownloadCloud, Layers, LoaderCircle } from "lucide-react";
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
-import { requestRemainingAction, requestSeasonAction } from "../app/actions";
+import { useRouter } from "../lib/use-router";
+import {
+  requestRemainingAction,
+  requestSeasonAction,
+  type RequestTrackingActionResult,
+} from "../app/actions";
 import { runAction } from "../lib/run-action";
+import { useAcquisitionLock } from "./acquisition-lock";
+import { AcquireResultNotice, isLockedResult } from "./request-state";
 import { isDemoModeClient } from "../lib/demo-mode";
 import { DemoAcquirePlayback } from "./demo-acquire-playback";
 import type { DemoAcquisitionEntry } from "../lib/demo-session";
 import { useDemoAcquiredTmdbIds } from "../lib/use-demo-session";
-import { resourcePickerHref } from "../lib/resource-picker-link";
 
 export function RequestSeasonButton({
   tmdbId,
@@ -17,7 +22,6 @@ export function RequestSeasonButton({
   storageId,
   titleAcquiring = false,
   demoEntry,
-  replaceExisting = false,
 }: {
   tmdbId: number;
   seasonNumber: number;
@@ -28,12 +32,16 @@ export function RequestSeasonButton({
   titleAcquiring?: boolean;
   /** Demo only: recorded to the session library when the scripted playback ends. */
   demoEntry?: DemoAcquisitionEntry | undefined;
-  /** 手动选择整季新包时，覆盖当前季已有视频/字幕。 */
-  replaceExisting?: boolean;
 }) {
   const router = useRouter();
+  const lock = useAcquisitionLock();
   const [isPending, startTransition] = useTransition();
-  const [resultMessage, setResultMessage] = useState<string | null>(null);
+  const [result, setResult] = useState<RequestTrackingActionResult | null>(null);
+  const scope = `season-${seasonNumber}`;
+  const isLocked = isLockedResult(result);
+  const mine = lock?.acquiring === scope;
+  const othersAcquiring = (lock != null && lock.acquiring != null && !mine) || titleAcquiring;
+  const inFlight = isPending || mine;
   const demo = isDemoModeClient();
   const [demoPlaying, setDemoPlaying] = useState(false);
   const acquiredIds = useDemoAcquiredTmdbIds();
@@ -52,53 +60,47 @@ export function RequestSeasonButton({
   }
 
   return (
-    <div className="season-action-group">
+    <>
       <button
-        className="primary-button"
+        className="season-request-button"
         type="button"
-        title={titleAcquiring ? "该剧正在获取中，请稍候" : `检索第 ${seasonNumber} 季资源`}
-        disabled={titleAcquiring}
+        title={
+          othersAcquiring && !inFlight ? "该剧正在获取中，请稍候" : result?.message ?? `获取第 ${seasonNumber} 季`
+        }
+        disabled={isPending || isLocked || othersAcquiring}
         onClick={() => {
           if (demo) {
             setDemoPlaying(true);
             return;
           }
+          lock?.lock(scope);
           startTransition(async () => {
-            const result = await runAction(
+            const r = await runAction(
               () => requestSeasonAction({ tmdbId, seasonNumber, storageId }),
-              (message) => setResultMessage(message),
+              (msg) => {
+                setResult({ status: "unsupported", message: msg });
+                // 必须 refresh:lock.acquiring 是前端 state,靠重挂载重置。
+                // 失败不刷新,锁永远卡住,兄弟按钮全禁用(Copilot round 1)。
+                router.refresh();
+              },
             );
-            if (result.ok) {
-              setResultMessage(result.value.message);
-              router.refresh();
-            }
+            if (!r.ok) return;
+            setResult(r.value);
+            router.refresh();
           });
         }}
       >
-        {isPending ? <LoaderCircle size={15} className="spin" aria-hidden /> : <DownloadCloud size={13} aria-hidden />}
-        {isPending ? "请求中" : "获取本季"}
+        {inFlight ? (
+          <LoaderCircle size={13} className="spin" aria-hidden />
+        ) : isLocked ? (
+          <Check size={13} aria-hidden />
+        ) : (
+          <DownloadCloud size={13} aria-hidden />
+        )}
+        {inFlight ? "获取中" : isLocked ? "已请求" : "获取本季"}
       </button>
-      <button
-        className="primary-button manual-acquire-button"
-        type="button"
-        disabled={isPending}
-        onClick={() =>
-          router.push(
-            resourcePickerHref({
-              kind: "season",
-              tmdbId,
-              seasonNumber,
-              ...(replaceExisting ? { replaceExisting: true } : {}),
-              ...(storageId ? { storageId } : {}),
-            }),
-          )
-        }
-      >
-        <ListChecks size={15} aria-hidden />
-        {replaceExisting ? "重新检索本季" : "手动获取"}
-      </button>
-      {resultMessage ? <p className="request-result">{resultMessage}</p> : null}
-    </div>
+      <AcquireResultNotice result={result} />
+    </>
   );
 }
 
@@ -120,8 +122,14 @@ export function RequestRemainingButton({
   demoEntry?: DemoAcquisitionEntry | undefined;
 }) {
   const router = useRouter();
+  const lock = useAcquisitionLock();
   const [isPending, startTransition] = useTransition();
-  const [resultMessage, setResultMessage] = useState<string | null>(null);
+  const [result, setResult] = useState<RequestTrackingActionResult | null>(null);
+  const scope = "remaining";
+  const isLocked = isLockedResult(result);
+  const mine = lock?.acquiring === scope;
+  const othersAcquiring = (lock != null && lock.acquiring != null && !mine) || titleAcquiring;
+  const inFlight = isPending || mine;
   const demo = isDemoModeClient();
   const [demoPlaying, setDemoPlaying] = useState(false);
   const acquiredIds = useDemoAcquiredTmdbIds();
@@ -140,44 +148,43 @@ export function RequestRemainingButton({
   }
 
   return (
-    <div className="season-action-group">
+    <>
       <button
         className="primary-button"
         type="button"
-        title={titleAcquiring ? "该剧正在获取中，请稍候" : "检索剩余季资源"}
-        disabled={titleAcquiring}
+        title={othersAcquiring && !inFlight ? "该剧正在获取中，请稍候" : result?.message ?? label}
+        disabled={isPending || isLocked || othersAcquiring}
         onClick={() => {
           if (demo) {
             setDemoPlaying(true);
             return;
           }
+          lock?.lock(scope);
           startTransition(async () => {
-            const result = await runAction(
+            const r = await runAction(
               () => requestRemainingAction({ tmdbId, storageId }),
-              (message) => setResultMessage(message),
+              (msg) => {
+                setResult({ status: "unsupported", message: msg });
+                // 同上一处:失败必须 refresh 清锁,否则 sibling 全禁用。
+                router.refresh();
+              },
             );
-            if (result.ok) {
-              setResultMessage(result.value.message);
-              router.refresh();
-            }
+            if (!r.ok) return;
+            setResult(r.value);
+            router.refresh();
           });
         }}
       >
-        {isPending ? <LoaderCircle size={15} className="spin" aria-hidden /> : <Layers size={14} aria-hidden />}
-        {isPending ? "请求中" : label}
+        {inFlight ? (
+          <LoaderCircle size={14} className="spin" aria-hidden />
+        ) : isLocked ? (
+          <Check size={14} aria-hidden />
+        ) : (
+          <Layers size={14} aria-hidden />
+        )}
+        {inFlight ? "获取中" : isLocked ? "已请求" : label}
       </button>
-      <button
-        className="primary-button manual-acquire-button"
-        type="button"
-        disabled={isPending}
-        onClick={() =>
-          router.push(resourcePickerHref({ kind: "remaining", tmdbId, ...(storageId ? { storageId } : {}) }))
-        }
-      >
-        <ListChecks size={15} aria-hidden />
-        手动获取
-      </button>
-      {resultMessage ? <p className="request-result">{resultMessage}</p> : null}
-    </div>
+      <AcquireResultNotice result={result} />
+    </>
   );
 }

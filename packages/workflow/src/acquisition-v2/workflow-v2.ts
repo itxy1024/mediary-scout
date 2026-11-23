@@ -1,15 +1,25 @@
+import type { AgentMemoryStore } from "../agent-memory.js";
 import type { LanguageModel } from "ai";
-import type { ResourceProvider, StorageExecutor } from "../ports.js";
+import type { AcquisitionDriveContext, ResourceProvider, StorageExecutor } from "../ports.js";
 import type { AuditEvent } from "../domain.js";
 import {
+  bindRecoveryDirectories,
   ensureSeasonAcquisitionDirectories,
+  stagingCleanupUnverifiedAuditEvent,
+  stagingKeptAuditEvent,
+  stagingLeakAuditEvent,
   withStagingCleanup,
+  type StagingCleanupUnverified,
+  type StagingKeptUnmoved,
+  type StagingLeak,
+  type StagingRecoveryDirectories,
   type AcquisitionDirectories,
 } from "./directory-lifecycle.js";
 import type { DeadLinkStore } from "./dead-links.js";
 import { readLandedSize } from "./landed-size.js";
 import type { AgentToolEvent } from "./activity.js";
-import { runAcquisitionV2, type AcquisitionV2Outcome } from "./orchestrator.js";
+import { runAcquisitionV2, type AcquisitionV2Outcome, type RunAcquisitionV2Request, type RunAcquisitionV2Result } from "./orchestrator.js";
+import type { JevJudge } from "../jev-judge.js";
 import { syncSeasonNeed } from "./sync-need.js";
 import type { SearchProfile } from "./search-profile.js";
 
@@ -49,6 +59,7 @@ export interface RunAcquisitionV2WorkflowRequest {
   originCountries?: string[];
   searchHints?: string;
   qualityGuidance?: string;
+  selectionPreference?: string;
   /** The task's fine-grained search profile — enables the anime taboo-keyword
    *  validator (warnings only, never blocking). 病2b。 */
   searchProfile?: SearchProfile;
@@ -56,9 +67,27 @@ export interface RunAcquisitionV2WorkflowRequest {
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
   assrtToken?: string;
-  /** 覆盖整季时清理目标季的视频/字幕，并从空的已获取状态开始。 */
-  replaceExisting?: boolean;
+  /** Optional Jev candidate prefilter (see orchestrator.jevJudge). */
+  jevJudge?: JevJudge;
   deadLinkStore?: DeadLinkStore;
+  /** Agent memory (see orchestrator.memory). */
+  memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
+  /** A replace_request run (see orchestrator.userRequest). Its episodes join the
+   *  agent's need, and the run goes ahead even when nothing is missing. */
+  userRequest?: RunAcquisitionV2Request["userRequest"];
+  /** See orchestrator.protectExisting. */
+  protectExisting?: RunAcquisitionV2Request["protectExisting"];
+  /** See orchestrator.rejectedLookup. */
+  rejectedLookup?: RunAcquisitionV2Request["rejectedLookup"];
+  /** See orchestrator.linkHistory. */
+  linkHistory?: RunAcquisitionV2Request["linkHistory"];
+  /** Leftover staging. The orphan dir is the staging handle; season dirs are resolved
+   *  under `showDirectoryId`. The agent runs even when the DB already says complete. */
+  stagingRecovery?: StagingRecoveryDirectories;
+  /** Web-reference tools (alternate titles, fan-season ↔ TMDB episode mapping). */
+  titleResearch?: { web: { llmBaseURL?: string; llmApiKey?: string; timeoutMs?: number; limit?: number } };
+  /** Ordered active drives for this account in unified multi-drive mode. */
+  drives?: AcquisitionDriveContext[];
   onProgress?: (event: AgentToolEvent) => void;
 }
 
@@ -77,15 +106,33 @@ export interface RunAcquisitionV2WorkflowResult {
   landedFileCount?: number;
   landedBytes?: number;
   auditEvents: AuditEvent[];
+  /** Drives on which season target directories were materialized during this run. */
+  touchedTargetDrives?: RunAcquisitionV2Result["touchedTargetDrives"];
+  /** Present only on a replace_request run (see orchestrator). */
+  replacement?: RunAcquisitionV2Result["replacement"];
 }
 
 const EMPTY_OUTCOME: AcquisitionV2Outcome = { resourceSnapshots: [], decisions: [], transferAttempts: [] };
 
-export async function runAcquisitionV2Workflow(
+async function resolveAcquisitionDirectories(
   request: RunAcquisitionV2WorkflowRequest,
-): Promise<RunAcquisitionV2WorkflowResult> {
-  // 7a — verify-or-create the directory tree, get scoped handles.
-  const directories = await ensureSeasonAcquisitionDirectories({
+  multiDrive: boolean,
+): Promise<AcquisitionDirectories> {
+  if (request.stagingRecovery) {
+    return bindRecoveryDirectories({
+      ...request.stagingRecovery,
+      executor: request.executor,
+      seasons: request.seasons.map((season) => season.seasonNumber),
+    });
+  }
+  if (multiDrive) {
+    return {
+      showDirectoryId: "",
+      seasonDirectoryIds: Object.fromEntries(request.seasons.map((s) => [s.seasonNumber, ""])),
+      stagingDirectoryId: "",
+    };
+  }
+  return ensureSeasonAcquisitionDirectories({
     executor: request.executor,
     categoryParentId: request.categoryParentId,
     showName: request.title.name,
@@ -94,27 +141,41 @@ export async function runAcquisitionV2Workflow(
     seasons: request.seasons.map((season) => season.seasonNumber),
     workflowRunId: request.workflowRunId,
   });
+}
+
+export async function runAcquisitionV2Workflow(
+  request: RunAcquisitionV2WorkflowRequest,
+): Promise<RunAcquisitionV2WorkflowResult> {
+  const multiDrive = Boolean(!request.stagingRecovery && request.drives && request.drives.length > 0);
+  const directories = await resolveAcquisitionDirectories(request, multiDrive);
 
   // Harness-level leak guard: whatever the agent does (covers, fails, or
   // reportNoCoverage), the run's staging dir is discarded when this returns or
   // throws — the 斗破苍穹 335-file leak fix. The agent keeps its own discardStaging
   // (and normally calls it); this is the deterministic backstop.
-  return await withStagingCleanup(
-    { executor: request.executor, stagingDirectoryId: directories.stagingDirectoryId },
-    async () => {
+  // The cleanup reads the show dir back afterwards: a delete the provider quietly
+  // ignored (123 file/trash + string FileId, 2026-09-20) must surface as a
+  // `staging_leaked` audit event instead of vanishing behind {removed:true}.
+  const leaks: StagingLeak[] = [];
+  const unverified: StagingCleanupUnverified[] = [];
+  const kept: StagingKeptUnmoved[] = [];
+  // Assigned inside runAcquisitionV2 the moment the sandbox exists, so a throw
+  // from the agent loop still lets this finally see files whose move failed.
+  const unmovedStaging: { read: (() => string[]) | null } = { read: null };
+  const terminalCleanup: { read: (() => boolean) | null } = { read: null };
+  const runBody = async (): Promise<RunAcquisitionV2WorkflowResult> => {
   const seasonsForSync = request.seasons.map((season) => ({
     seasonNumber: season.seasonNumber,
     latestAiredEpisode: season.latestAiredEpisode,
   }));
-  const priorObtained = request.replaceExisting ? [] : request.priorObtained ?? [];
-
-  if (request.replaceExisting) {
-    await clearExistingSeasonMedia(request.executor, Object.values(directories.seasonDirectoryIds));
-  }
+  const priorObtained = request.priorObtained ?? [];
 
   // 7b — sync the need from the DB marks (应有 − 实有). No 115 scan, no parser.
   const before = syncSeasonNeed({ seasons: seasonsForSync, obtained: priorObtained });
-  if (before.missing.length === 0) {
+  // A user request runs the agent even on a complete library: the episodes to
+  // replace are obtained (the old file is there), so they are never "missing".
+  // A leftover may be the only copy of an episode the DB already calls obtained.
+  if (before.missing.length === 0 && !request.userRequest && !request.stagingRecovery) {
     // Already current — no agent run, no side effects (the type-3 no-op path).
     return {
       directories,
@@ -138,9 +199,13 @@ export async function runAcquisitionV2Workflow(
       kind: "tv",
       title: request.title.name,
       aliases: request.title.aliases,
+      year: request.title.year,
       seasons: request.seasons.map((season) => season.seasonNumber),
+      // Only the truly missing ones: episodes to replace join the need inside the
+      // orchestrator and are described separately in the USER REQUESTS block.
       missingEpisodes: before.missing,
       qualityPreference: request.qualityPreference,
+      ...(request.title.tmdbId ? { tmdbId: request.title.tmdbId } : {}),
     },
     stagingDirectoryId: directories.stagingDirectoryId,
     targetSeasonDirectoryIds: directories.seasonDirectoryIds,
@@ -150,15 +215,34 @@ export async function runAcquisitionV2Workflow(
     ...(request.originCountries === undefined ? {} : { originCountries: request.originCountries }),
     ...(request.searchHints === undefined ? {} : { searchHints: request.searchHints }),
     ...(request.qualityGuidance === undefined ? {} : { qualityGuidance: request.qualityGuidance }),
+    ...(request.selectionPreference === undefined ? {} : { selectionPreference: request.selectionPreference }),
     ...(request.searchProfile === undefined ? {} : { searchProfile: request.searchProfile }),
     ...(request.storageProvider === undefined ? {} : { storageProvider: request.storageProvider }),
     ...(request.assrtToken === undefined ? {} : { assrtToken: request.assrtToken }),
+    ...(request.jevJudge === undefined ? {} : { jevJudge: request.jevJudge }),
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
+    ...(request.memory ? { memory: request.memory } : {}),
+    ...(request.userRequest ? { userRequest: request.userRequest } : {}),
+    ...(request.stagingRecovery
+      ? { stagingRecovery: true as const, protectExisting: { episodes: "unknown" as const } }
+      : request.protectExisting
+        ? { protectExisting: request.protectExisting }
+        : {}),
+    ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
+    ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
+    ...(request.titleResearch === undefined ? {} : { titleResearch: request.titleResearch }),
+    ...(request.drives === undefined ? {} : { drives: request.drives }),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
+    unmovedStaging,
+    ...(request.stagingRecovery ? { terminalCleanup } : {}),
   });
 
   // Reconcile from the AGENT'S coverage (its markObtained), NOT a 115 re-scan:
   // 实有 after = prior DB marks ∪ what the agent marked this run (§1.13/§7b).
+  // An episode the user asked to replace is in priorObtained, so it stays obtained
+  // whether or not the replacement landed. The agent's side carries such an episode
+  // only once it was reported replaced (sandbox finish): one declared file-less and
+  // reported not_found never becomes obtained on a bare mark.
   const after = syncSeasonNeed({
     seasons: seasonsForSync,
     obtained: [...priorObtained, ...v2.coverage.obtained],
@@ -168,10 +252,44 @@ export async function runAcquisitionV2Workflow(
   // not a claimed quality). Reads AFTER the acquisition succeeded; on the heavy
   // run where the 115 call budget is spent this returns undefined rather than
   // throwing, so the size is simply omitted — never failing a good run.
-  const landed = await readLandedSize(
-    request.executor,
-    Object.values(directories.seasonDirectoryIds),
-  );
+  // A replace run skips it (like the movie path): its season dirs hold the old
+  // AND the new copies, and the replace notification drops the size anyway.
+  if (multiDrive && v2.touchedTargetDrives && v2.touchedTargetDrives.length > 0) {
+    const firstTouched = v2.touchedTargetDrives[0]!;
+    if (firstTouched.showDirectoryId) {
+      directories.showDirectoryId = firstTouched.showDirectoryId;
+    }
+    for (const touched of v2.touchedTargetDrives) {
+      for (const [seasonNum, dirId] of Object.entries(touched.seasonDirectoryIds)) {
+        const sn = Number(seasonNum);
+        if (!directories.seasonDirectoryIds[sn] && dirId) {
+          directories.seasonDirectoryIds[sn] = dirId;
+        }
+      }
+    }
+  }
+
+  let landed: { fileCount: number; totalBytes: number } | undefined;
+  if (!request.userRequest) {
+    if (!multiDrive) {
+      landed = await readLandedSize(request.executor, Object.values(directories.seasonDirectoryIds));
+    } else if (v2.touchedTargetDrives && v2.touchedTargetDrives.length > 0) {
+      const parts = await Promise.all(
+        v2.touchedTargetDrives.map((touched) => readLandedSize(touched.executor, touched.directoryIds)),
+      );
+      let totalFiles = 0;
+      let totalBytes = 0;
+      for (const part of parts) {
+        if (part) {
+          totalFiles += part.fileCount;
+          totalBytes += part.totalBytes;
+        }
+      }
+      if (totalFiles > 0) {
+        landed = { fileCount: totalFiles, totalBytes };
+      }
+    }
+  }
 
   return {
     directories,
@@ -182,26 +300,46 @@ export async function runAcquisitionV2Workflow(
     obtained: after.obtained,
     providerAhead: after.providerAhead,
     auditEvents: v2.auditEvents,
+    ...(v2.touchedTargetDrives ? { touchedTargetDrives: v2.touchedTargetDrives } : {}),
     ...(landed ? { landedFileCount: landed.fileCount, landedBytes: landed.totalBytes } : {}),
+    ...(v2.replacement ? { replacement: v2.replacement } : {}),
   };
-    },
-  );
-}
+  };
 
-const REPLACEABLE_MEDIA = /\.(?:mkv|mp4|avi|ts|m2ts|mov|flv|wmv|srt|ass|ssa|sub|idx|vtt|sup|smi)$/i;
-
-/** 覆盖模式只删除视频和字幕，保留 Season 目录及 NFO/海报等元数据。 */
-async function clearExistingSeasonMedia(
-  executor: Pick<StorageExecutor, "listTree" | "deleteFiles">,
-  directoryIds: string[],
-): Promise<void> {
-  for (const directoryId of directoryIds) {
-    const files = await executor.listTree({ directoryId });
-    const fileIds = files
-      .filter((file) => REPLACEABLE_MEDIA.test(file.path))
-      .map((file) => file.providerFileId);
-    if (fileIds.length > 0) {
-      await executor.deleteFiles({ directoryId, fileIds });
-    }
+  // In multi-drive mode, MultiDriveStorageV2 runs its own per-drive staging cleanup
+  // inside runAcquisitionV2's finally block.
+  const result = multiDrive
+    ? await runBody()
+    : await withStagingCleanup(
+        {
+          executor: request.executor,
+          stagingDirectoryId: directories.stagingDirectoryId,
+          parentDirectoryId: directories.showDirectoryId,
+          onLeak: (leak) => leaks.push(leak),
+          onCleanupUnverified: (event) => unverified.push(event),
+          keep: () => {
+            const fileCount = unmovedStaging.read?.().length ?? 0;
+            return fileCount > 0 ? { fileCount } : null;
+          },
+          // The adopted leftover can be the only copy. A throw must not delete it,
+          // and a normal exit deletes it only after discardStaging. finish does not.
+          ...(request.stagingRecovery
+            ? { preserveOnThrow: true, discardOnNormalReturn: () => terminalCleanup.read?.() ?? false }
+            : {}),
+          onKept: (event) => kept.push(event),
+        },
+        runBody,
+      );
+  const stagingEvents = [
+    ...leaks.map((leak) => stagingLeakAuditEvent(leak)),
+    ...unverified.map((event) => stagingCleanupUnverifiedAuditEvent(event)),
+    ...kept.map((event) => stagingKeptAuditEvent(event)),
+  ];
+  if (stagingEvents.length === 0) {
+    return result;
   }
+  return {
+    ...result,
+    auditEvents: [...result.auditEvents, ...stagingEvents],
+  };
 }
